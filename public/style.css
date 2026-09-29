@@ -1,0 +1,363 @@
+:root {
+  --bg: #16120f;
+  --surface: #221d19;
+  --surface-2: #2c2622;
+  --line: #3a322c;
+  --text: #f3ece4;
+  --muted: #a99e92;
+  --accent: #d97757;
+  --accent-2: #c4633f;
+  --ultra: #b98be0;
+  --ultra-2: #9a63c9;
+  --ok: #6cc28f;
+  --rec: #e5534b;
+  --radius: 16px;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+/* Author display rules (.field's flex, .mic-btn's grid) otherwise beat the UA's
+   [hidden] style, and the element shows anyway. */
+[hidden] { display: none !important; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  /* Fixed app shell: the .app fills the viewport and the dir results scroll
+     internally, so the document itself never scrolls (no iOS rubber-banding). */
+  overflow: hidden;
+  overscroll-behavior: none;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  font-size: 17px;
+  -webkit-text-size-adjust: 100%;
+}
+
+.app {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: max(16px, env(safe-area-inset-top)) 16px calc(24px + env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  /* min-height (not height): the shell fills the viewport so .launch pins to the
+     bottom, but grows for its content instead of shrinking children into each
+     other. The body's overflow:hidden clips anything past the viewport (e.g.
+     when the keyboard is up) rather than letting the page scroll. */
+  min-height: 100vh;
+  min-height: 100dvh;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 8px;
+}
+.top h1 { font-size: 22px; font-weight: 700; margin: 0; letter-spacing: -0.02em; }
+
+.field { display: flex; flex-direction: column; gap: 10px; }
+
+.selected-dir {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 15px;
+  color: var(--accent);
+  word-break: break-all;
+}
+
+.chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.chip {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 9px 14px;
+  font-size: 14px;
+  font-weight: 500;
+}
+.chip.active { background: var(--accent); border-color: var(--accent); color: #1b1714; font-weight: 600; }
+
+.search-wrap { position: relative; }
+.search-row { display: flex; gap: 8px; }
+
+.segmented {
+  display: flex;
+  gap: 4px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 4px;
+}
+.segmented button {
+  flex: 1;
+  background: transparent;
+  color: var(--muted);
+  border-radius: calc(var(--radius) - 6px);
+  padding: 12px;
+  font-weight: 600;
+  font-size: 15px;
+}
+.segmented button.active { background: var(--accent); color: #1b1714; }
+
+input, textarea {
+  width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 14px 16px;
+  font-size: 16px; /* >=16px stops iOS auto-zoom */
+  font-family: inherit;
+}
+input:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { resize: vertical; line-height: 1.4; }
+
+button {
+  font-family: inherit;
+  font-size: 16px;
+  border: none;
+  border-radius: var(--radius);
+  padding: 12px 16px;
+  color: var(--text);
+  background: var(--surface-2);
+}
+button:active { transform: scale(0.98); }
+.ghost { background: var(--surface); border: 1px solid var(--line); color: var(--muted); font-size: 14px; padding: 10px 14px; white-space: nowrap; }
+.count { color: var(--accent); font-weight: 700; }
+
+/* Floating dropdown: overlays the fields below instead of pushing them, so the
+   locked shell never has to compress (which caused Session name to overlap the
+   search). :empty keeps it out of the way when there are no results. */
+.results {
+  list-style: none; margin: 0; padding: 6px;
+  display: flex; flex-direction: column; gap: 6px;
+  position: absolute; top: calc(100% + 6px); left: 0; right: 0; z-index: 20;
+  max-height: 50dvh; overflow-y: auto; overscroll-behavior: contain;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: 0 14px 34px rgba(0,0,0,0.55);
+}
+.results:empty { display: none; }
+.results li {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 12px 14px;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.results li .src { font-family: -apple-system, sans-serif; font-size: 11px; color: #6f655b; margin-left: auto; text-transform: uppercase; letter-spacing: 0.05em; }
+.results li .src.frecent { color: var(--accent); }
+
+.launch { margin-top: auto; }
+/* row-reverse: DOM order is Claude then Ultracode, so reversing puts Ultracode
+   on the left and Claude on the right without reordering config/DOM. */
+.mode-buttons { display: flex; flex-direction: row-reverse; gap: 12px; }
+.mode-btn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 18px 20px;
+  border-radius: var(--radius);
+  font-weight: 700;
+  font-size: 19px;
+  color: #1b1714;
+}
+.mode-btn small { font-weight: 500; font-size: 13px; opacity: 0.8; }
+.mode-btn[data-mode="normal"] { background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.mode-btn[data-mode="ultracode"] { background: linear-gradient(135deg, var(--ultra), var(--ultra-2)); color: #fff; }
+.mode-btn[disabled] { opacity: 0.5; }
+
+/* modals */
+.modal {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.55);
+  display: flex; align-items: flex-end; justify-content: center;
+  z-index: 50;
+}
+.modal.hidden, .toast.hidden { display: none; }
+.sheet {
+  width: 100%; max-width: 640px;
+  background: var(--bg);
+  border-top-left-radius: 22px; border-top-right-radius: 22px;
+  border: 1px solid var(--line);
+  padding: 14px 14px calc(18px + env(safe-area-inset-bottom));
+  max-height: 80vh; display: flex; flex-direction: column; gap: 12px;
+}
+.sheet-head { display: flex; align-items: center; gap: 10px; }
+.browse-path { flex: 1; font-family: ui-monospace, monospace; font-size: 14px; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browse-list { list-style: none; margin: 0; padding: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.browse-list li { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px; display: flex; align-items: center; gap: 10px; }
+.browse-list li .meta { margin-left: auto; font-size: 12px; color: var(--muted); }
+.browse-list li .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.browse-list li .dot.on { background: var(--ok); }
+.wide { width: 100%; }
+.primary { background: var(--accent); color: #1b1714; font-weight: 700; padding: 16px; }
+
+.toast {
+  position: fixed;
+  left: 50%; bottom: calc(20px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 14px 18px;
+  border-radius: 14px;
+  font-size: 14px;
+  max-width: 90%;
+  z-index: 60;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+}
+.toast.ok { border-color: var(--ok); }
+.toast.err { border-color: var(--accent-2); }
+.toast code { font-family: ui-monospace, monospace; color: var(--accent); }
+
+/* ---------- dictation ----------
+   Every state below keys off #promptField[data-dictation]; app.js only sets that
+   attribute, so button, border and status bar can never disagree. */
+.prompt-box { position: relative; }
+/* block: an inline textarea leaves a descender gap under it, which would push
+   the mic off the textarea's real bottom corner. */
+.prompt-box textarea { display: block; }
+/* Reserve a column for the mic so text never runs underneath it — only when the
+   mic is actually shown, so there is no dead gutter with dictation off. */
+.prompt-box.has-mic textarea { padding-right: 64px; min-height: 64px; }
+
+.mic-btn {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  transition: background .2s ease, color .2s ease, border-color .2s ease;
+}
+.mic-btn > * { grid-area: 1 / 1; } /* glyphs stack; state CSS shows one */
+.mic-btn[disabled] { opacity: 0.5; }
+.mic-icon { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.mic-stop, .mic-spinner, .dictate-spinner, .dictate-retry { display: none; }
+
+/* Recording: unmistakably red and pulsing, and the glyph becomes a stop square. */
+.prompt-field[data-dictation="recording"] textarea { border-color: var(--rec); }
+.prompt-field[data-dictation="recording"] .mic-btn { background: var(--rec); border-color: var(--rec); color: #fff; }
+.prompt-field[data-dictation="recording"] .mic-icon { display: none; }
+.prompt-field[data-dictation="recording"] .mic-stop { display: block; width: 16px; height: 16px; border-radius: 3px; background: #fff; }
+.prompt-field[data-dictation="recording"] .mic-btn::after {
+  content: "";
+  position: absolute;
+  inset: -5px;
+  border-radius: 50%;
+  border: 2px solid var(--rec);
+  pointer-events: none;
+  animation: mic-pulse 1.6s ease-out infinite;
+}
+@keyframes mic-pulse {
+  0%   { opacity: 0.8; transform: scale(1); }
+  100% { opacity: 0;   transform: scale(1.3); }
+}
+
+/* Starting / transcribing: the mic is disabled and shows a spinner instead. The
+   spinner is the state, so it stays at full strength rather than dimmed. */
+.prompt-field[data-dictation="starting"] .mic-icon,
+.prompt-field[data-dictation="transcribing"] .mic-icon { display: none; }
+.prompt-field[data-dictation="starting"] .mic-btn,
+.prompt-field[data-dictation="transcribing"] .mic-btn { opacity: 1; color: var(--accent); }
+.prompt-field[data-dictation="starting"] .mic-spinner,
+.prompt-field[data-dictation="transcribing"] .mic-spinner,
+.prompt-field[data-dictation="transcribing"] .dictate-spinner {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  animation: spin 0.8s linear infinite;
+}
+.prompt-field[data-dictation="transcribing"] .dictate-spinner { width: 14px; height: 14px; color: var(--accent); flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.dictate-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding-left: 6px;
+  font-size: 14px;
+  color: var(--muted);
+}
+.dictate-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--rec);
+  flex: none;
+  animation: rec-blink 1s ease-in-out infinite alternate;
+}
+@keyframes rec-blink { to { opacity: 0.35; } }
+.dictate-status { color: var(--text); font-weight: 600; }
+.dictate-elapsed { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-variant-numeric: tabular-nums; }
+.dictate-level {
+  flex: 1;
+  max-width: 120px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.dictate-level > span {
+  display: block;
+  height: 100%;
+  background: var(--rec);
+  transform-origin: left center;
+  transform: scaleX(0);
+}
+.dictate-cancel { margin-left: auto; min-height: 44px; }
+/* Starting shows the label + Cancel; transcribing the spinner, label + Cancel;
+   failed what went wrong + Retry + Discard (the Cancel button, relabelled). */
+.prompt-field[data-dictation="starting"] .dictate-dot,
+.prompt-field[data-dictation="starting"] .dictate-elapsed,
+.prompt-field[data-dictation="starting"] .dictate-level,
+.prompt-field[data-dictation="transcribing"] .dictate-dot,
+.prompt-field[data-dictation="transcribing"] .dictate-elapsed,
+.prompt-field[data-dictation="transcribing"] .dictate-level,
+.prompt-field[data-dictation="failed"] .dictate-dot,
+.prompt-field[data-dictation="failed"] .dictate-elapsed,
+.prompt-field[data-dictation="failed"] .dictate-level { display: none; }
+/* The message can run to a few lines at phone width; the buttons keep their size. */
+.prompt-field[data-dictation="failed"] .dictate-status { flex: 1; min-width: 0; font-weight: 500; }
+.prompt-field[data-dictation="failed"] .dictate-cancel { margin-left: 0; }
+.prompt-field[data-dictation="failed"] .dictate-retry {
+  display: block;
+  flex: none;
+  min-height: 44px;
+  padding: 10px 16px;
+  background: var(--accent);
+  color: #1b1714;
+  font-size: 14px;
+  font-weight: 700;
+}
+.dictate-retry[disabled] { opacity: 0.5; }
+
+@media (prefers-reduced-motion: reduce) {
+  .prompt-field[data-dictation="recording"] .mic-btn::after { animation: none; opacity: 0.6; }
+  .dictate-dot { animation: none; }
+  /* A spinner is the only progress signal here, so slow it rather than stop it. */
+  .mic-spinner, .dictate-spinner { animation-duration: 2s !important; }
+}

@@ -1,0 +1,31 @@
+{
+  "port": 8838,
+  "host": "127.0.0.1",
+  "token": null,
+  "remoteControl": true,
+  "allowedRoots": ["~"],
+  "allowedHosts": ["127.0.0.1", "localhost"],
+  "transcription": { "enabled": true, "keyFile": "~/.config/audiorecorder/config", "maxSeconds": 600, "maxBytes": 26214400 },
+  "models": [
+    { "id": "opus", "label": "Opus" },
+    { "id": "fable", "label": "Fable" }
+  ],
+  "modes": [
+    {
+      "id": "normal",
+      "label": "Claude",
+      "subtitle": "standard session",
+      "args": []
+    },
+    {
+      "id": "ultracode",
+      "label": "Ultracode",
+      "subtitle": "xhigh + workflow orchestration",
+      "args": ["--settings", "{\"ultracode\":true}"]
+    }
+  ],
+  "favorites": [
+    { "label": "development", "path": "~/development" },
+    { "label": "home (~)", "path": "~" }
+  ]
+}

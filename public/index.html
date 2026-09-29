@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Claude Launcher</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <meta name="theme-color" content="#1b1714" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Claude" />
+  <link rel="apple-touch-icon" href="/icon-180.png" />
+  <link rel="icon" href="/icon-192.png" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="top">
+      <h1>Claude Launcher</h1>
+      <button id="sessionsBtn" class="ghost" title="Running sessions">
+        <span id="sessionsCount" class="count">0</span> sessions
+      </button>
+    </header>
+
+    <section class="field" id="dirField">
+      <div id="selectedDir" class="selected-dir" tabindex="0">~</div>
+      <div id="favorites" class="chips"></div>
+      <div class="search-wrap">
+        <div class="search-row">
+          <input id="dirSearch" type="search" inputmode="search" autocomplete="off"
+                 autocapitalize="off" spellcheck="false" placeholder="Search dirs (frecency + filesystem)…" />
+          <button id="browseBtn" class="ghost" type="button">Browse</button>
+        </div>
+        <ul id="dirResults" class="results"></ul>
+      </div>
+    </section>
+
+    <section class="field">
+      <input id="sessionName" type="text" autocomplete="off" autocapitalize="off"
+             spellcheck="false" placeholder="Session name (auto from directory)" />
+    </section>
+
+    <!-- data-dictation (idle | starting | recording | transcribing | failed) drives
+         every dictation visual from CSS; app.js only changes that attribute and
+         the bar's two labels. -->
+    <section class="field prompt-field" id="promptField" data-dictation="idle">
+      <div id="promptBox" class="prompt-box">
+        <textarea id="prompt" rows="3" placeholder="Initial prompt (optional) — e.g. review the diff and propose fixes"></textarea>
+        <!-- Hidden until /api/config reports transcription is available. -->
+        <button id="micBtn" class="mic-btn" type="button" aria-label="Dictate prompt" aria-pressed="false" hidden>
+          <svg class="mic-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+            <rect x="9" y="3" width="6" height="11" rx="3" />
+            <path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" />
+          </svg>
+          <span class="mic-stop" aria-hidden="true"></span>
+          <span class="mic-spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+      <div id="dictateBar" class="dictate-bar" hidden>
+        <span class="dictate-dot" aria-hidden="true"></span>
+        <span class="dictate-spinner" aria-hidden="true"></span>
+        <span id="dictateStatus" class="dictate-status" role="status">Recording</span>
+        <span id="dictateElapsed" class="dictate-elapsed" role="timer">0:00</span>
+        <span class="dictate-level" aria-hidden="true"><span id="dictateLevel"></span></span>
+        <button id="dictateRetry" class="dictate-retry" type="button">Retry</button>
+        <button id="dictateCancel" class="ghost dictate-cancel" type="button">Cancel</button>
+      </div>
+    </section>
+
+    <section class="field" id="modelField" hidden>
+      <div id="modelSelect" class="segmented"></div>
+    </section>
+
+    <section class="launch">
+      <div id="modeButtons" class="mode-buttons"></div>
+    </section>
+  </main>
+
+  <!-- Browse modal -->
+  <div id="browseModal" class="modal hidden">
+    <div class="sheet">
+      <div class="sheet-head">
+        <button id="browseUp" class="ghost">↑ Up</button>
+        <span id="browsePath" class="browse-path">~</span>
+        <button id="browseClose" class="ghost">Close</button>
+      </div>
+      <ul id="browseList" class="browse-list"></ul>
+      <button id="browseUse" class="primary wide">Use this folder</button>
+    </div>
+  </div>
+
+  <!-- Sessions modal -->
+  <div id="sessionsModal" class="modal hidden">
+    <div class="sheet">
+      <div class="sheet-head">
+        <span class="browse-path">Running tmux sessions</span>
+        <button id="sessionsClose" class="ghost">Close</button>
+      </div>
+      <ul id="sessionsList" class="browse-list"></ul>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,7 @@
+# Local settings (favorites, tailnet host): install.sh creates it from config.example.json.
+config.json
+
+# Playwright CLI page snapshots.
+.playwright-cli/
+
+node_modules/
