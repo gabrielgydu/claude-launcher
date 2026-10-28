@@ -25,7 +25,7 @@ https://<machine>.<tailnet>.ts.net/    ──► 127.0.0.1:8838  (node server.mj
                                               └─ GET  /api/transcribe/<id>  processing | done + text | error
                                                         │
                                                         ▼
-                                              ffmpeg -> AssemblyAI (batch API)
+                                              ffmpeg -> stt transcribe (Soniox by default)
 ```
 
 `POST /api/launch` runs, for the chosen directory:
@@ -57,7 +57,7 @@ Tap the mic in the prompt box, speak, tap it again.
 
 The words land in the prompt at the cursor (at the end if you never placed one), with a space added where they meet other words; edit them or launch straight away.
 
-English, Portuguese and German are detected per clip, so you can switch between them freely.
+The language is identified per clip, guided by stt's language hints (Portuguese, English and German by default), so you can switch between them freely.
 
 The mic only works through the `https://…ts.net` URL: browsers expose the microphone to secure pages only.
 
@@ -75,11 +75,15 @@ The mic only works through the `https://…ts.net` URL: browsers expose the micr
 
     Under 0.5 s is "no audio captured"; more than 5 s over `maxSeconds` is refused.
 
-4. The mp3 is read into memory and the temp dir is deleted before any network traffic.
+4. The mp3 is read into memory and the temp dir is deleted before `stt` starts, so the clip is off the disk before any network traffic.
 
-5. The clip goes to AssemblyAI's batch API: upload, submit with language detection (`en`/`pt`/`de`, English fallback) and your key terms, then a status check every second for up to 4 minutes.
+5. The mp3 goes on stdin to `stt transcribe --json --no-speakers --timeout 240 -`, which sends it to the configured provider (Soniox by default) with stt's language hints and key terms.
 
-    Status checks that fail transiently (network, timeout, 5xx, 429) are waited out for up to a minute since the last good answer.
+    stt retries a failed upload twice, waits out up to a minute of failing status checks, and gives up after 4 minutes, the phone's own deadline.
+
+    stt writes the transcript before it deletes the provider's copy, and the job is done as soon as the transcript arrives, so the phone never waits for that clean-up.
+
+    If `stt` itself hangs, the server stops it after 6 minutes (`SIGTERM`, then `SIGKILL` 3 s later), and the job fails with "transcription timed out" unless its transcript had already arrived.
 
 6. The phone polls `GET /api/transcribe/<id>` until it reads `done` (with `text`, `language`, `durationMs`) or `error`.
 
@@ -87,9 +91,11 @@ The mic only works through the `https://…ts.net` URL: browsers expose the micr
 
     `error` always carries `retryable`.
 
-    It is `false` when sending the same clip again would fail the same way, and then a `code` says why: `no_audio` (too short or not audio), `too_long` (over `maxSeconds`) or `conversion` (ffmpeg choked on the clip).
+    It is `false` when sending the same clip again would fail the same way, and then a `code` says why: `no_audio` (too short or not audio), `too_long` (over `maxSeconds`), `conversion` (ffmpeg choked on the clip) or `config` (stt is missing or its config needs fixing on the PC).
 
-7. The server deletes the transcript at AssemblyAI, which deletes the uploaded audio there too.
+    Every other failure past `ffmpeg` is retryable, and its `error` is stt's own one-line reason (its last `stt: ` line, cut to 300 characters).
+
+7. stt deletes the provider's copy of the audio and the transcript once the text is back, and also when the job fails, times out or is stopped.
 
 The prompt draft is autosaved in the phone's localStorage, and so is the id of a pending transcription, so a reload or a killed app during transcription doesn't lose the text: reopen it within 30 minutes and the transcript still arrives, appended at the end with a note saying so.
 
@@ -109,49 +115,54 @@ Retry sends the same recording again, or, when the PC was only unreachable, keep
 
 A new recording or a successful launch discards it, pending id included, so its text can't turn up in a later prompt.
 
-Retry isn't offered when the same clip would fail the same way: too short, over the length limit, too large to send, or dictation turned off on the PC (no key, no `ffmpeg`).
+Retry isn't offered when the same clip would fail the same way: too short, over the length limit, too large to send, or dictation turned off on the PC (no `stt` or a broken stt config, no `ffmpeg`).
 
 Those show a message and nothing more.
 
 ### Requirements
 
 - `ffmpeg` and `ffprobe` on the service's `PATH`, with the `libmp3lame` encoder (Arch's `ffmpeg` package has it).
-- An AssemblyAI API key.
+- `stt` on the service's `PATH` (`~/development/stt/install.sh` links it into `~/.local/bin`), with a config that `stt check` accepts.
 
 The mic button is hidden while either is missing.
 
 `GET /api/config` says why in `transcribe.reason`.
 
-### Key and key terms
+### Provider, key and key terms
 
-The key is read for every dictation from the `ASSEMBLYAI_API_KEY` environment variable, or else from `assemblyai_api_key` in `~/.config/audiorecorder/config` — the file `../audiorecorder` already uses, so the key is set once for both.
+Dictation is transcribed by `stt`, the speech-to-text command every transcription tool on this machine shares: Soniox by default, AssemblyAI selectable.
 
-The format is the same as there: `key=value` lines, `#` comments, and the last uncommented value wins.
+stt owns the provider, the API key, the language hints and the key terms, all in `~/.config/stt/config` (see `~/development/stt/README.md`), so they are set once for every tool.
 
-`assemblyai_keyterms` (comma-separated) in the same file is sent as AssemblyAI key terms, which bias recognition towards those words.
+The launcher never reads the key.
 
-Phrases longer than six words are dropped and the list is capped at 1000, AssemblyAI's limits.
+It runs `stt check` (no network, about 0.1 s) to decide whether the mic is shown, and reuses an OK answer for a minute.
 
-If AssemblyAI ever rejects the key terms, the dictation is retried without them rather than failed.
+A broken stt config turns the mic off with stt's own message as the reason, and fixing it turns the mic back on with the next request, without a restart.
+
+A dictation that hits a config problem drops the reused answer, so the next request checks again.
 
 The key never leaves this machine and is never logged; the phone holds no secret.
 
 ### Settings
 
 ```json
-"transcription": { "enabled": true, "keyFile": "~/.config/audiorecorder/config", "maxSeconds": 600, "maxBytes": 26214400 }
+"transcription": { "enabled": true, "maxSeconds": 600, "maxBytes": 26214400 }
 ```
 
 - `enabled` — `false` hides the mic.
-- `keyFile` — where the key and key terms are read from.
 - `maxSeconds` — the longest dictation; the phone stops recording there.
 - `maxBytes` — upload size cap, 25 MB (a ten-minute clip is about 5 MB).
 
 Every key is optional and defaults to the value shown.
 
+A `keyFile` left in the block from before stt is ignored.
+
 Like the rest of `config.json`, the block is re-read on each request.
 
 At most 4 transcriptions run at once; a fifth upload gets `429`.
+
+An `stt` that has delivered its transcript and is only deleting the provider's copy no longer counts.
 
 ### Retention
 
@@ -165,13 +176,17 @@ Temp dirs orphaned by a crash are swept at the next start and every 10 minutes a
 
 The transcript is held in memory only, until 30 minutes after its job finished (a restart drops it sooner).
 
-The logs record job ids, sizes, durations, timings, language and status — never the transcript text.
+The logs record job ids, sizes, durations, timings, language, provider and status — never the transcript text.
 
-At AssemblyAI, the transcript (and with it the uploaded audio) is deleted as soon as the text is back; a delete that fails transiently (network, timeout, 5xx, 429) is tried again up to three times over about a minute and a half.
+`stt` reads the mp3 from stdin and keeps it in memory; nothing it does writes the audio to disk.
 
-If the server stopped waiting early, it keeps checking in the background for up to 30 minutes and deletes the transcript once it finishes; AssemblyAI refuses to delete one that is still processing.
+At the provider, stt deletes the job (the uploaded audio and the transcript) as soon as the text is back, and also when the job fails, times out or is cancelled.
 
-That clean-up is best effort: if the server restarts in between, or every delete attempt fails, AssemblyAI keeps the transcript for 30 days, and an upload whose submit failed can't be deleted through the API at all (it expires there within 24–48 h).
+Stopping the service sends `SIGTERM` to every `stt` still running, and stt deletes its job on the way out.
+
+The server's 6-minute backstop sends `SIGKILL` 3 s after its `SIGTERM`, which can cut that clean-up short when the network has stalled.
+
+What stt cannot always delete (a job the provider still refuses to delete because it is processing, an upload interrupted before its id came back) is described in `~/development/stt/README.md`.
 
 On the phone, the prompt draft stays in localStorage until you launch or clear it.
 
@@ -190,7 +205,7 @@ On the first run it creates `config.json` from `config.example.json` and adds th
 
 Then on your iPhone: open the printed `https://…ts.net/` URL in Safari → **Share → Add to Home Screen**.
 
-Dictation also needs `ffmpeg` on this machine and an AssemblyAI key; see [Requirements](#requirements).
+Dictation also needs `ffmpeg` and a working `stt` on this machine; see [Requirements](#requirements).
 
 > HTTPS needs Tailscale HTTPS certificates enabled for your tailnet (one toggle
 > in the admin console). The installer tells you if it isn't.
@@ -269,12 +284,12 @@ Check with `systemctl --user status claude-launcher`: the `CGroup:` tree must li
 - The launcher talks to your normal tmux server (`/tmp/tmux-$(id -u)/default`), so sessions appear in your interactive `tmux ls` too.
 - Zero npm dependencies — pure Node standard library.
 
-  Dictation runs `ffmpeg`/`ffprobe` as child processes and calls AssemblyAI with the built-in `fetch`.
+  Dictation runs `ffmpeg`, `ffprobe` and `stt` as child processes, without a shell.
 
 ## Tests
 
 ```bash
-node --test test/transcribe.test.mjs   # the dictation API (about 25 s)
+node --test test/transcribe.test.mjs   # the dictation API (about 20 s)
 node test/browser.mjs                  # the PWA in headless Chromium with a fake microphone (about 45 s)
 node --test test/systemd-scope.test.mjs  # a service stop leaves the tmux server alive (under 1 s)
 ```
@@ -299,31 +314,41 @@ It prints one `ok`/`FAIL` line per check, then `PASS` or `FAIL` with the counts,
 
 Nothing of the live setup.
 
-Each test starts its own `server.mjs` on a free port, with a throwaway `config.json`, a fake key file, its own `TMPDIR` and a stub AssemblyAI (a small `node:http` server inside the test process).
+Each test starts its own `server.mjs` on a free port, with a throwaway `config.json`, its own `TMPDIR`, an `STT_CONFIG` that does not exist, and a stand-in `stt`: a small script that asks a `node:http` stub inside the test process what to answer.
+
+Even the real `stt` reached by mistake would stop at "no key" before any network.
+
+One case runs the real `stt` with a throwaway config holding `provider = fake`, which needs no key and never touches the network; it is skipped when `stt` is not on `PATH`.
 
 The launch buttons are never pressed.
 
 The browser test also aborts `/api/launch` at the network layer, and the test config's `allowedRoots` is a scratch dir, so even a stray launch would be refused.
 
-`test/harness.mjs` holds that shared plumbing: the stub, the server spawner and the clip generator.
+`test/harness.mjs` holds that shared plumbing: the stand-in `stt`, the server spawner and the clip generator.
 
 ### What they cover
 
 `transcribe.test.mjs` sends an iOS-shaped fragmented MP4/AAC clip and a WebM/Opus clip (Firefox, older Chrome) through the real server and `ffmpeg`; current Chrome's Opus in MP4 is covered by `browser.mjs`.
 
-It checks the mp3 the stub received (mono 16 kHz, full length) and the request it got: auth header, language detection, cleaned-up key terms.
+It checks the mp3 `stt` got on stdin (mono 16 kHz, full length, the temp dir already gone) and the arguments it was run with, and that an empty transcript (silence) is a finished job with empty text.
 
-It checks where the key comes from: the environment over the file, the last uncommented line winning, and dictation disabled with a reason when there is no key, all re-read without a restart.
+It checks when the mic is on: `stt check` failing turns it off with stt's message and passing turns it back on without a restart, a missing `stt` says how to install it, and an OK check is reused for the upload but dropped once a job hits a config problem.
 
-It checks failures at AssemblyAI (a transcript error, a 401 or 500 on upload, key terms rejected and retried without them, five status checks in a row reset, a delete reset once) and bad audio (0.2 s, not audio at all, over `maxSeconds`), including which of them are marked not retryable.
+It checks failures at `stt`: its `stt: ` line carried to the phone and cut to 300 characters, a config problem (exit 3) not retryable, output that is not a JSON transcript or is over 1 MB, a crash without stt's own line, and a hung `stt` stopped by the backstop with `SIGTERM` and, when that is ignored, `SIGKILL`.
 
-It checks that an uploaded DASH manifest can't make `ffmpeg` read a local file, that `ffmpeg` killed for flooding its log is a failed conversion rather than a truncated transcript, and that a stop mid-upload leaves no clip behind.
+It checks that a job is done as soon as `stt` writes its transcript, while stt is still deleting the provider's copy, and that a backstop cutting that clean-up short keeps the transcript.
+
+Through the real `stt` and its fake provider it checks a transcript, a provider refusal (retryable) and a config problem (not retryable, mic off).
+
+It checks bad audio (0.2 s, not audio at all, over `maxSeconds`), including which of them are marked not retryable.
+
+It checks that an uploaded DASH manifest can't make `ffmpeg` read a local file, that `ffmpeg` killed for flooding its log is a failed conversion rather than a truncated transcript, that a stop mid-upload leaves no clip behind, and that a stop while `stt` runs stops `stt` too.
 
 It checks that a broken `transcription` block only turns dictation off, with `/api/config` still answering.
 
 It checks every refusal: 415, 413 by header and by stream (with the socket closed rather than drained), 400, 403 cross-site, 404, and 429 past four concurrent jobs.
 
-After every case it checks that no dictation temp dir is left, and at the end that neither the key nor any transcript text reached the server log.
+After every case it checks that no dictation temp dir is left, and at the end that no transcript text reached the server log.
 
 `browser.mjs` dictates into the middle of a typed prompt and checks the text lands at the caret with one space each side.
 
@@ -337,11 +362,13 @@ Neither covers a real iPhone: Chromium never records AAC, so iOS recorder behavi
 
 ### Test hooks in the server
 
-Three environment variables let a test run its own server without touching the live service, its config or the AssemblyAI account:
+Three environment variables let a test run its own server without touching the live service, its config or a provider:
 
 - `CLAUDE_LAUNCHER_CONFIG` — the `config.json` to use instead of the one next to `server.mjs`.
-- `ASSEMBLYAI_BASE_URL` — the AssemblyAI API root (default `https://api.assemblyai.com`), for pointing at a stub.
-- `ASSEMBLYAI_API_KEY` — the key, overriding the key file.
+- `CLAUDE_LAUNCHER_STT` — the `stt` command to run (default `stt` from `PATH`), for pointing at a stand-in.
+- `CLAUDE_LAUNCHER_STT_BACKSTOP_MS` — how long one `stt` run may take before the server stops it (default 6 minutes).
+
+`STT_CONFIG` belongs to stt itself: the config file it reads instead of `~/.config/stt/config`.
 
 ## Teardown
 

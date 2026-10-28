@@ -1,6 +1,6 @@
 // Dictation in a real browser: Chromium with a fake microphone playing an
 // espeak-ng clip, against the real server.mjs (and so real ffmpeg on whatever
-// Chromium's MediaRecorder produced) with a stub AssemblyAI behind it.
+// Chromium's MediaRecorder produced) with a stand-in stt behind it.
 //
 //   node test/browser.mjs
 //
@@ -16,7 +16,7 @@ import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import os from 'node:os';
 import path from 'node:path';
-import { missingTools, makeClips, probeAudio, startAssemblyAIStub, startServer, baseConfig, waitFor } from './harness.mjs';
+import { missingTools, makeClips, probeAudio, startSttStub, startServer, baseConfig, waitFor } from './harness.mjs';
 
 // The app has no npm dependencies, so there is no local node_modules to find
 // Playwright in unless someone installed one: fall back to the global install.
@@ -29,7 +29,6 @@ const { chromium } = await loadPlaywright();
 
 // What the stub "hears", padded to prove the page gets trimmed text.
 const STUB_TEXT = 'the null check in the parser and';
-const ENV_KEY = `browser-test-key-${randomUUID()}`;
 const DRAFT_KEY = 'claude-launcher.draft';
 const PENDING_KEY = 'claude-launcher.dictation';
 
@@ -71,13 +70,8 @@ async function cleanup() {
 
 try {
   const clips = await makeClips(work, 'Please fix the failing upload test and then run the whole suite again.');
-  const keyFile = path.join(work, 'aai.conf');
-  await writeFile(keyFile, 'assemblyai_keyterms=Claude\n', { mode: 0o600 });
-  stub = await startAssemblyAIStub({ text: `  ${STUB_TEXT}  `, language: 'en' });
-  server = await startServer({
-    config: baseConfig({ keyFile }),
-    env: { ASSEMBLYAI_API_KEY: ENV_KEY, ASSEMBLYAI_BASE_URL: stub.url },
-  });
+  stub = await startSttStub({ text: `  ${STUB_TEXT}  `, language: 'en' });
+  server = await startServer({ config: baseConfig(), env: stub.env });
   const BASE = server.base;
 
   browser = await chromium.launch({
@@ -185,12 +179,12 @@ try {
   check('microphone released', await page.evaluate(() => !dict.stream && !dict.recorder && !dict.audioCtx));
   check('pending job id cleared', (await stored(PENDING_KEY)) === null);
   check('one upload, typed audio/*', uploads.length === 1 && /^audio\//.test(uploads[0].type || ''), JSON.stringify(uploads));
-  check('the server passed one clip on to AssemblyAI', stub.uploads.length === 1, `stub uploads: ${stub.uploads.length}`);
-  if (stub.uploads.length) {
+  check('the server passed one clip on to stt', stub.calls.length === 1, `stt calls: ${stub.calls.length}`);
+  if (stub.calls.length) {
     // Proves ffmpeg on the server decoded what Chromium's MediaRecorder wrote,
     // and that the clip covers the whole recording (about t2 + the stop flush).
     const sent = path.join(work, 'sent.mp3');
-    await writeFile(sent, stub.uploads[0].body);
+    await writeFile(sent, stub.calls[0].audio);
     const a = await probeAudio(sent);
     check('clip decoded on the server: mp3, mono 16 kHz, as long as the recording',
       a.codec === 'mp3' && a.channels === 1 && a.sampleRate === 16000 && a.duration > t2 - 0.5 && a.duration < t2 + 2.5,
@@ -226,7 +220,7 @@ try {
 
   // ---------- (d) server error -> kept in the bar -> Retry succeeds ----------
   console.log('\n(d) a failed transcription stays in the bar, and Retry re-sends it');
-  stub.outcomes.push({ error: 'stub: the audio could not be decoded' });
+  stub.outcomes.push({ exit: 4, message: 'the audio could not be decoded' });
   const beforeD = await value();
   const uploadsBeforeD = uploads.length;
   await dictate(2000);
@@ -265,7 +259,7 @@ try {
 
   // ---------- (d2) a new recording replaces a kept failure ----------
   console.log('\n(d2) a new recording replaces the kept failure');
-  stub.outcomes.push({ error: 'stub: the audio could not be decoded' });
+  stub.outcomes.push({ exit: 4, message: 'the audio could not be decoded' });
   await dictate(1500);
   await waitPhase('failed');
   await page.click('#micBtn');
@@ -276,7 +270,7 @@ try {
   await waitPhase('idle');
   check('the new dictation inserts', (await value()).split(STUB_TEXT).length - 1 === 3);
   // And Discard drops a kept failure outright.
-  stub.outcomes.push({ error: 'stub: the audio could not be decoded' });
+  stub.outcomes.push({ exit: 4, message: 'the audio could not be decoded' });
   await dictate(1500);
   await waitPhase('failed');
   await page.click('#dictateCancel');
@@ -300,7 +294,7 @@ try {
   check('too short: the clip is dropped, nothing inserted',
     (await page.evaluate(() => dict.blob === null)) && (await value()) === beforeD3);
   for (const [label, reply, want, retry] of [
-    ['503 (dictation off on the PC)', { status: 503, body: { error: 'no AssemblyAI key: set ASSEMBLYAI_API_KEY' } }, /unavailable on the PC: no AssemblyAI key/, false],
+    ['503 (dictation off on the PC)', { status: 503, body: { error: 'soniox_api_key is not set in ~/.config/stt/config' } }, /unavailable on the PC: soniox_api_key is not set/, false],
     ['413 (too large)', { status: 413, body: { error: 'audio is larger than 26214400 bytes' } }, /too large to send/, false],
     ['415', { status: 415, body: { error: 'content-type must be audio/*' } }, /refused/, false],
     ['429 (PC busy)', { status: 429, body: { error: 'too many transcriptions in progress' } }, /busy/, true],
@@ -319,13 +313,13 @@ try {
   // ---------- (e) a reload mid-transcription resumes the job ----------
   console.log('\n(e) reload while transcribing: the pending job is resumed, 15 min on');
   stub.outcomes.push({ hold: true });
-  const heldBefore = stub.transcripts.size;
+  const heldBefore = stub.calls.length;
   await dictate(2000);
   await waitPhase('transcribing', 5000);
   const pendingSaved = await waitFor(() => stored(PENDING_KEY), { timeout: 10000 });
   check('pending job id saved in localStorage', !!pendingSaved, String(pendingSaved));
-  check('job reached AssemblyAI and is held there',
-    await waitFor(() => stub.transcripts.size === heldBefore + 1, { timeout: 10000 }));
+  check('job reached stt and is held there',
+    await waitFor(() => stub.calls.length === heldBefore + 1, { timeout: 10000 }));
   // As if iOS had killed the app and it was reopened a quarter of an hour later:
   // past the old 10-minute window, inside the server's 30.
   await page.evaluate((k) => {
@@ -366,11 +360,11 @@ try {
   const hung = [];
   await page.route('**/api/transcribe/*', (route) => { hung.push(route); }); // never answered
   stub.outcomes.push({ hold: true });
-  const heldG = stub.transcripts.size;
+  const heldG = stub.calls.length;
   await dictate(1500);
   await waitPhase('transcribing', 5000);
   check('poll hangs', await waitFor(() => hung.length > 0, { timeout: 10000 }));
-  check('job reached AssemblyAI', await waitFor(() => stub.transcripts.size === heldG + 1, { timeout: 10000 }));
+  check('job reached stt', await waitFor(() => stub.calls.length === heldG + 1, { timeout: 10000 }));
   check('Cancel shown while transcribing', (await page.isVisible('#dictateCancel'))
     && (await page.textContent('#dictateCancel')) === 'Cancel');
   const uploadsG = uploads.length;
@@ -389,16 +383,16 @@ try {
   stub.release();
   await waitPhase('idle');
   check('Retry waited on the same job instead of uploading again',
-    uploads.length === uploadsG && stub.transcripts.size === heldG + 1, `${uploads.length - uploadsG} uploads`);
+    uploads.length === uploadsG && stub.calls.length === heldG + 1, `${uploads.length - uploadsG} uploads`);
   check('its text is inserted', (await value()).endsWith(STUB_TEXT), JSON.stringify(await value()));
 
   // ---------- (h) a failed poll after a long suspend ----------
   console.log('\n(h) the first poll after a long suspend fails');
   stub.outcomes.push({ hold: true });
-  const heldH = stub.transcripts.size;
+  const heldH = stub.calls.length;
   await dictate(1500);
   await waitPhase('transcribing', 5000);
-  check('job reached AssemblyAI', await waitFor(() => stub.transcripts.size === heldH + 1, { timeout: 10000 }));
+  check('job reached stt', await waitFor(() => stub.calls.length === heldH + 1, { timeout: 10000 }));
   // The page was frozen past the 4-minute deadline; the first request after it
   // fails because the network isn't back yet. Set up in one task, so no regular
   // poll can slip in between.
@@ -482,8 +476,7 @@ try {
   check('no console errors', consoleErrors.length === 0, JSON.stringify(consoleErrors));
   check('/api/launch never called', launchCalls === 0, `${launchCalls} calls`);
   check('no dictation temp dirs left on the server', await waitFor(async () => (await server.tempDirs()).length === 0, { timeout: 3000 }));
-  check('server log holds neither the key nor the transcript',
-    !server.log.includes(ENV_KEY) && !server.log.includes(STUB_TEXT), server.log.slice(-500));
+  check('server log holds no transcript text', !server.log.includes(STUB_TEXT), server.log.slice(-500));
 } catch (e) {
   failures++;
   console.log(`  FAIL  ${e.stack || e}`);

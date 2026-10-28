@@ -1,9 +1,11 @@
-// Shared plumbing for the dictation tests: a stub AssemblyAI, the real server.mjs
-// on a free port with its own config and temp dir, and audio made at test time.
+// Shared plumbing for the dictation tests: a stand-in `stt` command, the real
+// server.mjs on a free port with its own config and temp dir, and audio made at
+// test time.
 //
-// Nothing here touches the live service (port 8838), the project's config.json
-// or the real AssemblyAI key file: every server gets a throwaway config, a fake
-// key file and ASSEMBLYAI_BASE_URL pointing at the stub.
+// Nothing here touches the live service (port 8838), the project's config.json,
+// stt's config or a provider: every server gets a throwaway config, its own
+// TMPDIR, and an STT_CONFIG that does not exist, so even the real stt reached by
+// mistake stops at "no key" before any network.
 import http from 'node:http';
 import net from 'node:net';
 import { spawn, execFile } from 'node:child_process';
@@ -92,130 +94,164 @@ export async function makeClips(dir, sentence = 'Refactor the upload handler and
   return c;
 }
 
-// ---------- stub AssemblyAI ----------
-// Implements the four routes server.mjs uses and records everything it is sent.
-// Behaviour is scripted per test through these queues, each entry consumed by the
-// next matching request:
-//   uploadFailures  [{ status, body }]                 next POST /v2/upload fails
-//   submitFailures  [{ status, body, onlyWithKeyterms }] next POST /v2/transcript fails
-//   pollFailures    [{ status, body } | { reset }]      next GET /v2/transcript/<id> fails
-//   deleteFailures  [{ status, body } | { reset }]      next DELETE /v2/transcript/<id> fails
-//   outcomes        [{ error } | { hold } | { pollsBeforeDone, text, language }]
-//                   applied to the next transcript created
-// { reset: true } drops the connection without an answer, like a network blip.
-// A held transcript reports "processing" until release().
-export async function startAssemblyAIStub({ text, language = 'en' } = {}) {
-  let seq = 0;
+// ---------- a stand-in stt ----------
+// A fake `stt` executable (point CLAUDE_LAUNCHER_STT at stub.bin, as stub.env does)
+// that asks a loopback stub in the test process what to do. The stub records
+// every call and answers from a queue scripted per test:
+//   stub.check      { exit, message }   what `stt check` does (default: exit 0)
+//   stub.outcomes   applied to the next `stt transcribe`, in order:
+//     { text, language }      exit 0 with a --json transcript (stub.text/.language by default;
+//                             an empty text has no utterances, like silence)
+//     { exit, message }       progress noise, then "stt: <message>" as the last stderr line
+//     { exit, stderr }        exactly this stderr (a crash without stt's own last line)
+//     { raw }                 exit 0 with exactly this on stdout
+//     { hang, ignoreTerm }    never finishes; on SIGTERM it exits 143 like stt, unless ignoreTerm
+//     { hold: true, ... }     waits for release() first
+//     { cleanup: 'hold' }     the transcript, then stt's deletion of the provider copy waits
+//                             for release() before it exits 0
+//     { cleanup: 'hang' }     the transcript, then a deletion that never ends; on SIGTERM it
+//                             exits 143 the way stt does once its transcript is out
+// Each call is { argv, audio, pid, tempDirs }: tempDirs are the dictation temp dirs
+// that existed in the server's TMPDIR while stt ran.
+const FAKE_STT = `#!${process.execPath}
+// The stand-in stt of test/harness.mjs. No import statements: Node runs it as
+// either module type.
+(async () => {
+  const fs = await import('node:fs');
+  const os = await import('node:os');
+  const argv = process.argv.slice(2);
+  let ignoreTerm = false;
+  let delivered = false;
+  process.on('SIGTERM', () => {
+    if (ignoreTerm) return;
+    process.stderr.write(delivered ? 'stt: SIGTERM arrived after the transcript was written\\n' : 'stt: cancelled by SIGTERM\\n');
+    process.exit(143);
+  });
+  const hang = () => {
+    setInterval(() => {}, 1000);
+    setTimeout(() => process.exit(1), 60000).unref(); // never outlive a test run by much
+  };
+  process.stdout.on('error', () => process.exit(1)); // the reader went away
+  const chunks = [];
+  if (argv[0] === 'transcribe' && argv[argv.length - 1] === '-') for await (const c of process.stdin) chunks.push(c);
+  const tempDirs = fs.readdirSync(os.tmpdir()).filter((n) => n.startsWith(${JSON.stringify(TMP_PREFIX)}));
+  let r;
+  try {
+    const res = await fetch(process.env.FAKE_STT_URL + '/' + argv[0], {
+      method: 'POST',
+      body: JSON.stringify({ argv, pid: process.pid, tempDirs, audio: Buffer.concat(chunks).toString('base64') }),
+    });
+    r = await res.json();
+  } catch (e) {
+    process.stderr.write('stt: fake stt: the test stub is gone (' + e.message + ')\\n');
+    process.exit(1);
+  }
+  if (r.hang) {
+    ignoreTerm = !!r.ignoreTerm;
+    return hang();
+  }
+  const write = (stream, s) => new Promise((resolve) => (s ? stream.write(s, resolve) : resolve()));
+  await write(process.stderr, r.stderr);
+  await write(process.stdout, r.stdout);
+  if (r.cleanup) {
+    // The transcript is out; what follows stands for stt deleting the provider's copy.
+    delivered = true;
+    if (r.cleanup === 'hang') return hang();
+    await fetch(process.env.FAKE_STT_URL + '/cleanup', { method: 'POST', body: '{}' }).catch(() => {});
+  }
+  process.exitCode = r.exit;
+})();
+`;
+
+export async function startSttStub({ text, language = 'en' } = {}) {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'claude-launcher-fake-stt-'));
+  const bin = path.join(dir, 'stt');
+  await writeFile(bin, FAKE_STT, { mode: 0o755 });
+  const held = [];
   const stub = {
     text,
     language,
-    requests: [],
-    uploads: [],
-    submits: [],
-    deletes: [],
-    transcripts: new Map(),
-    uploadFailures: [],
-    submitFailures: [],
-    pollFailures: [],
-    deleteFailures: [],
+    bin,
+    check: { exit: 0 },
+    checks: [],
+    calls: [],
     outcomes: [],
     url: '',
+    // What startServer() needs to run this stub's stt.
+    get env() { return { CLAUDE_LAUNCHER_STT: bin, FAKE_STT_URL: stub.url }; },
     reset() {
-      for (const k of ['requests', 'uploads', 'submits', 'deletes', 'uploadFailures', 'submitFailures',
-        'pollFailures', 'deleteFailures', 'outcomes']) stub[k] = [];
-      stub.transcripts.clear();
+      stub.check = { exit: 0 };
+      stub.checks = [];
+      stub.calls = [];
+      stub.outcomes = [];
     },
     release() {
-      for (const t of stub.transcripts.values()) t.hold = false;
+      for (const resume of held.splice(0)) resume();
     },
   };
+  const progress = 'Uploading audio to the stub...\nTranscribing with stub...\n';
   const server = http.createServer(async (req, res) => {
     const chunks = [];
     for await (const c of req) chunks.push(c);
-    const body = Buffer.concat(chunks);
-    const url = new URL(req.url, 'http://stub');
-    const auth = req.headers.authorization;
-    stub.requests.push({ method: req.method, path: url.pathname, auth });
-    const send = (status, obj) => {
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(typeof obj === 'string' ? obj : JSON.stringify(obj));
+    const call = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const send = (obj) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(obj));
     };
-    const fail = (f) => (f.reset ? req.socket.destroy() : send(f.status, f.body));
-    if (!auth) return send(401, { error: 'Authentication error, API token missing/invalid' });
-
-    if (req.method === 'POST' && url.pathname === '/v2/upload') {
-      stub.uploads.push({ auth, contentType: req.headers['content-type'], body });
-      const f = stub.uploadFailures.shift();
-      if (f) return send(f.status, f.body);
-      return send(200, { upload_url: `https://cdn.stub.invalid/upload/${stub.uploads.length}` });
+    if (req.url === '/check') {
+      stub.checks.push(call.argv);
+      const c = stub.check;
+      return send(c.exit ? { exit: c.exit, stdout: 'provider: stub\n', stderr: `stt: ${c.message}\n` } : { exit: 0, stdout: 'provider: stub\n' });
     }
-    if (req.method === 'POST' && url.pathname === '/v2/transcript') {
-      let json;
-      try { json = JSON.parse(body.toString('utf8')); } catch { return send(400, { error: 'json data invalid' }); }
-      stub.submits.push({ auth, contentType: req.headers['content-type'], json });
-      const f = stub.submitFailures[0];
-      if (f && (!f.onlyWithKeyterms || json.keyterms_prompt)) {
-        stub.submitFailures.shift();
-        return send(f.status, f.body);
-      }
-      const id = `tr_${++seq}`;
-      stub.transcripts.set(id, { id, polls: 0, status: 'processing', ...(stub.outcomes.shift() || {}) });
-      return send(200, { id, status: 'queued' });
+    if (req.url === '/cleanup') {
+      await new Promise((resolve) => held.push(resolve));
+      return send({});
     }
-    const m = /^\/v2\/transcript\/([^/]+)$/.exec(url.pathname);
-    if (m) {
-      const t = stub.transcripts.get(decodeURIComponent(m[1]));
-      if (!t) return send(400, { error: 'Transcript lookup error, transcript id not found' });
-      if (req.method === 'DELETE') {
-        const f = stub.deleteFailures.shift();
-        if (f) return fail(f);
-        // Like the real API: a transcript still processing can't be deleted.
-        if (t.status === 'processing') return send(400, { error: 'Transcript lookup error, transcript id not found' });
-        stub.deletes.push(t.id);
-        return send(200, { id: t.id, status: t.status, text: 'Deleted by user.' });
-      }
-      if (req.method === 'GET') {
-        const f = stub.pollFailures.shift();
-        if (f) return fail(f);
-        t.polls++;
-        if (t.hold || t.polls <= (t.pollsBeforeDone || 0)) return send(200, { id: t.id, status: 'processing' });
-        if (t.error) {
-          t.status = 'error';
-          return send(200, { id: t.id, status: 'error', error: t.error, text: null });
-        }
-        t.status = 'completed';
-        return send(200, {
-          id: t.id,
-          status: 'completed',
-          text: t.text ?? stub.text,
-          language_code: t.language ?? stub.language,
-          speech_model_used: 'universal-3-5-pro',
-        });
-      }
-    }
-    return send(404, { error: `stub: no route ${req.method} ${url.pathname}` });
+    if (req.url !== '/transcribe') return send({ exit: 2, stderr: `stt: stub: no command ${req.url}\n` });
+    stub.calls.push({ argv: call.argv, audio: Buffer.from(call.audio, 'base64'), pid: call.pid, tempDirs: call.tempDirs });
+    const o = stub.outcomes.shift() || {};
+    if (o.hold) await new Promise((resolve) => held.push(resolve));
+    if (o.hang) return send({ hang: true, ignoreTerm: !!o.ignoreTerm });
+    if (o.raw !== undefined) return send({ exit: 0, stdout: o.raw });
+    if (o.exit !== undefined) return send({ exit: o.exit, stderr: o.stderr ?? `${progress}stt: ${o.message}\n` });
+    const t = o.text ?? stub.text;
+    const utterances = t.trim() ? [{ text: t, speaker: null, start_ms: 0, end_ms: 1000, language: o.language ?? stub.language }] : [];
+    return send({
+      exit: 0,
+      stdout: JSON.stringify({ provider: 'stub', text: t, utterances }) + '\n',
+      stderr: `${progress}Transcription done.\n`,
+      cleanup: o.cleanup,
+    });
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   stub.url = `http://127.0.0.1:${server.address().port}`;
-  stub.close = () => new Promise((resolve) => {
+  stub.close = async () => {
+    stub.release();
     server.closeAllConnections();
-    server.close(() => resolve());
-  });
+    await new Promise((resolve) => server.close(() => resolve()));
+    await rm(dir, { recursive: true, force: true });
+  };
   return stub;
+}
+
+// The real stt command, for the tests that run it with the fake provider; null
+// when it is not installed.
+export async function realStt() {
+  try { return (await execFileP('sh', ['-c', 'command -v stt'])).stdout.trim() || null; } catch { return null; }
 }
 
 // ---------- the real server ----------
 // A config close to the shipped one. allowedRoots is always replaced by the
 // server's own scratch dir in startServer(): even a launch request that slipped
 // through could not reach a real directory (the page defaults to "~").
-export function baseConfig({ keyFile, transcription = {} }) {
+export function baseConfig({ transcription = {} } = {}) {
   return {
     host: '127.0.0.1',
     token: null,
     remoteControl: true,
     allowedHosts: ['127.0.0.1', 'localhost'],
-    transcription: { enabled: true, keyFile, maxSeconds: 600, maxBytes: 26214400, ...transcription },
+    transcription: { enabled: true, maxSeconds: 600, maxBytes: 26214400, ...transcription },
     models: [{ id: 'opus', label: 'Opus' }, { id: 'fable', label: 'Fable' }],
     modes: [
       { id: 'normal', label: 'Claude', subtitle: 'standard session', args: [] },
@@ -236,8 +272,10 @@ process.on('exit', () => {
 });
 
 // Spawns server.mjs with its own config file and TMPDIR (so its dictation temp
-// dirs can be counted exactly, and never mix with the live service's). Any
-// ASSEMBLYAI_* variable in the caller's environment is dropped; pass `env` to set one.
+// dirs can be counted exactly, and never mix with the live service's). The
+// caller's STT_*, CLAUDE_LAUNCHER_*, FAKE_STT_* and ASSEMBLYAI_* variables are
+// dropped, and STT_CONFIG names a file that does not exist; pass `env` (say
+// stub.env) to set them.
 export async function startServer({ config, env = {} }) {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'claude-launcher-test-'));
   const tmp = path.join(dir, 'tmp');
@@ -249,8 +287,14 @@ export async function startServer({ config, env = {} }) {
   await writeConfig(config);
 
   const childEnv = { ...process.env };
-  for (const k of Object.keys(childEnv)) if (k.startsWith('ASSEMBLYAI_')) delete childEnv[k];
-  Object.assign(childEnv, { PORT: String(port), HOST: '127.0.0.1', CLAUDE_LAUNCHER_CONFIG: configPath, TMPDIR: tmp }, env);
+  for (const k of Object.keys(childEnv)) if (/^(STT_|CLAUDE_LAUNCHER_|FAKE_STT_|ASSEMBLYAI_)/.test(k)) delete childEnv[k];
+  Object.assign(childEnv, {
+    PORT: String(port),
+    HOST: '127.0.0.1',
+    CLAUDE_LAUNCHER_CONFIG: configPath,
+    TMPDIR: tmp,
+    STT_CONFIG: path.join(dir, 'no-stt-config'),
+  }, env);
   const proc = spawn(process.execPath, [path.join(ROOT, 'server.mjs')], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
   liveServers.set(proc, dir);
   proc.once('exit', () => liveServers.delete(proc));

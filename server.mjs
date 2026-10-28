@@ -3,10 +3,9 @@
 import http from 'node:http';
 import { readFile, stat, readdir, writeFile, unlink, mkdtemp, rm } from 'node:fs/promises';
 import { readFileSync, existsSync, realpathSync, createWriteStream, rmSync } from 'node:fs';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import { setTimeout as sleep } from 'node:timers/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -274,17 +273,34 @@ async function launch({ dir, name, prompt, mode, model }) {
 
 // ---------- transcription ----------
 // Dictation: the phone uploads a recorded clip, this machine normalizes it with
-// ffmpeg and transcribes it with AssemblyAI's batch API. The key never leaves the
-// PC, so the phone holds no secret. Nothing is kept: the clip lives in a private
-// temp dir only until it is converted, the transcript is held in memory until the
-// job expires, and both are deleted at AssemblyAI once the transcript is back.
+// ffmpeg and transcribes it with the `stt` command (../stt, Soniox by default),
+// which owns the provider, its key, the language hints and the key terms. This
+// server never sees the key, and the phone holds no secret. Nothing is kept: the
+// clip lives in a private temp dir only until it is converted, the mp3 reaches stt
+// on stdin, the transcript is held in memory until the job expires, and stt deletes
+// the provider's copy once the transcript is back.
 const TRANSCRIBE_DEFAULTS = {
-  // Shared with ../audiorecorder, so the key and key terms are configured once.
-  keyFile: '~/.config/audiorecorder/config',
   maxSeconds: 600,
   maxBytes: 25 * 1024 * 1024,
 };
-const AAI_BASE = (process.env.ASSEMBLYAI_BASE_URL || 'https://api.assemblyai.com').replace(/\/+$/, '');
+// The override exists for tests. The service's PATH has ~/.local/bin, where
+// ../stt/install.sh links the command.
+const STT_BIN = process.env.CLAUDE_LAUNCHER_STT || 'stt';
+// `stt check` only reads stt's config (about 0.1 s, never the network).
+const STT_CHECK_TIMEOUT_MS = 5000;
+const STT_CHECK_CACHE_MS = 60 * 1000;
+// stt stops waiting for the provider after this, deletes the job and exits 6: the
+// phone stops polling at 4 minutes too.
+const STT_WAIT_SECONDS = 240;
+// The whole stt run, upload included, in case it hangs anyway: SIGTERM first (stt
+// deletes the provider job on the way out), then SIGKILL. The override exists for tests.
+const STT_BACKSTOP_MS = Number(process.env.CLAUDE_LAUNCHER_STT_BACKSTOP_MS) || 6 * 60 * 1000;
+const STT_KILL_GRACE_MS = 3000;
+// The JSON transcript of a ten-minute dictation is a few kB.
+const STT_MAX_OUTPUT = 1 << 20;
+// stt's exit status for a config problem (no key, unknown provider).
+const STT_EXIT_CONFIG = 3;
+const STT_MISSING = 'stt not found (run ~/development/stt/install.sh)';
 const TMP_PREFIX = 'claude-launcher-dictation-';
 const MAX_ACTIVE_TRANSCRIPTIONS = 4;
 const MAX_STORED_JOBS = 50;
@@ -298,53 +314,50 @@ const MIN_AUDIO_SECONDS = 0.5;
 // refusing a ten-minute dictation over half a second of overshoot would be absurd.
 const MAX_SECONDS_GRACE = 5;
 const FFMPEG_TIMEOUT_MS = 60 * 1000;
-const AAI_UPLOAD_TIMEOUT_MS = 120 * 1000;
-const AAI_SUBMIT_TIMEOUT_MS = 30 * 1000;
-const AAI_POLL_TIMEOUT_MS = 15 * 1000;
-const AAI_POLL_MS = 1000;
-const AAI_POLL_DEADLINE_MS = 4 * 60 * 1000;
-// How long transient poll failures are tolerated since the last good answer; the
-// transcript keeps running at AssemblyAI meanwhile, so a blip is waited out rather
-// than failing the dictation. Time, not a count: a Wi-Fi roam or DNS hiccup fails
-// each poll at once, and five of those used to fail the job in five seconds.
-const AAI_POLL_ERROR_WINDOW_MS = 60 * 1000;
-// Waits between DELETE attempts. The first is short because the usual failure is a
-// reused keep-alive socket the other side already closed; a single blip must not
-// leave the dictated text and audio at AssemblyAI for its 30-day retention.
-const AAI_DELETE_RETRY_MS = [2000, 20 * 1000, 60 * 1000];
-// How long a transcript we stopped waiting for is still watched, so it can be
-// deleted once it finishes (AssemblyAI refuses to delete one mid-processing).
-const AAI_CLEANUP_WAIT_MS = 30 * 60 * 1000;
-// AssemblyAI's limits: 1000 key terms on universal-3-5-pro (universal-2 uses the
-// first 200 and warns), at most six words per phrase.
-const MAX_KEYTERMS = 1000;
-const MAX_KEYTERM_WORDS = 6;
 // Temp dirs older than this are orphans whatever their pid says (pid reuse).
 const TMP_ORPHAN_AGE_MS = 60 * 60 * 1000;
 
-// Same format and semantics as ../audiorecorder's loader: key=value lines, '#'
-// comments, and the last uncommented value wins (the real file keeps an old key
-// commented out above the live one).
-async function readKeyFile(file) {
-  const out = {};
-  for (const raw of (await readFile(file, 'utf8')).split('\n')) {
-    const line = raw.trim();
-    const eq = line.indexOf('=');
-    if (!line || line.startsWith('#') || eq < 0) continue;
-    out[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+// stt's one-line reason for a failure: its last stderr line starting "stt: "
+// (key-free, about 300 characters). The progress lines before it are not for the
+// phone, and neither is anything else a crash might print.
+function sttMessage(stderr) {
+  const lines = String(stderr || '').split('\n').map((l) => l.trim());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i].startsWith('stt: ')) return lines[i].slice(0, 300);
   }
-  return out;
+  return null;
 }
 
-// AssemblyAI's validation is loose (a seven-word phrase is accepted silently), so
-// its limits are enforced here rather than trusted to come back as a 400.
-function parseKeyterms(raw) {
-  const terms = new Set();
-  for (const part of String(raw || '').split(',')) {
-    const term = part.trim();
-    if (term && term.split(/\s+/).length <= MAX_KEYTERM_WORDS) terms.add(term);
+// Only an OK answer is cached, and only for a minute: a broken stt config shows
+// on the next /api/config, and fixing it turns the mic back on at once.
+let sttCheck = null;
+let sttCheckAt = 0;
+let sttCheckProbe = null;
+function checkStt() {
+  if (sttCheck && sttCheck.ok && Date.now() - sttCheckAt < STT_CHECK_CACHE_MS) return Promise.resolve(sttCheck);
+  sttCheckProbe ||= probeStt().then((r) => {
+    sttCheck = r;
+    sttCheckAt = Date.now();
+    sttCheckProbe = null;
+    return r;
+  });
+  return sttCheckProbe;
+}
+// A transcription that found stt missing or its config broken drops the cached OK.
+function forgetSttCheck() {
+  sttCheck = null;
+}
+async function probeStt() {
+  try {
+    await execFileP(STT_BIN, ['check'], { timeout: STT_CHECK_TIMEOUT_MS, maxBuffer: STT_MAX_OUTPUT });
+    return { ok: true, reason: null };
+  } catch (e) {
+    if (e.code === 'ENOENT') return { ok: false, reason: STT_MISSING };
+    if (e.killed) return { ok: false, reason: `stt check timed out after ${STT_CHECK_TIMEOUT_MS / 1000} s` };
+    const line = sttMessage(e.stderr);
+    if (line) return { ok: false, reason: line.slice('stt: '.length) };
+    return { ok: false, reason: typeof e.code === 'number' ? `stt check exited with status ${e.code}` : `stt check failed: ${e.message}` };
   }
-  return [...terms].slice(0, MAX_KEYTERMS);
 }
 
 // Probed once and cached. A failed probe is retried after a minute, so installing
@@ -373,11 +386,11 @@ async function probeMediaTools() {
   }
 }
 
-// Re-evaluated per request, like config.json: a new key or new key terms apply to
-// the next dictation without a restart. The result holds the key, so it must never
-// be serialized — publicTranscribe() is the only view of it that leaves the process.
-// Never throws: a malformed transcription block (say a numeric keyFile) only turns
-// dictation off, instead of failing /api/config — and with it the whole launcher.
+// Re-evaluated per request, like config.json: a fixed stt config or a new ffmpeg
+// applies to the next dictation without a restart. publicTranscribe() is the only
+// view of the result that leaves the process.
+// Never throws: a malformed transcription block only turns dictation off, instead
+// of failing /api/config — and with it the whole launcher.
 async function transcriptionSetup() {
   try {
     return await readTranscriptionSetup();
@@ -387,36 +400,28 @@ async function transcriptionSetup() {
       reason: `invalid transcription config: ${e.message}`,
       maxSeconds: TRANSCRIBE_DEFAULTS.maxSeconds,
       maxBytes: TRANSCRIBE_DEFAULTS.maxBytes,
-      key: null,
-      keyterms: [],
     };
   }
 }
 async function readTranscriptionSetup() {
-  const t = getConfig().transcription || {};
+  // A leftover keyFile from before stt is ignored. "transcription": false would
+  // otherwise read as all defaults, dictation on.
+  const t = getConfig().transcription ?? {};
+  if (typeof t !== 'object' || Array.isArray(t)) throw new Error('"transcription" must be an object');
   const positive = (v, d) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : d);
   const setup = {
     enabled: false,
     reason: null,
     maxSeconds: positive(t.maxSeconds, TRANSCRIBE_DEFAULTS.maxSeconds),
     maxBytes: positive(t.maxBytes, TRANSCRIBE_DEFAULTS.maxBytes),
-    key: null,
-    keyterms: [],
   };
   if (t.enabled === false) {
     setup.reason = 'dictation is disabled in config.json';
     return setup;
   }
-  const keyFile = expandHome(t.keyFile || TRANSCRIBE_DEFAULTS.keyFile);
-  let fromFile = {};
-  let fileError = null;
-  try { fromFile = await readKeyFile(keyFile); } catch (e) { fileError = e.code || e.message; }
-  setup.key = (process.env.ASSEMBLYAI_API_KEY || '').trim() || fromFile.assemblyai_api_key || null;
-  setup.keyterms = parseKeyterms(fromFile.assemblyai_keyterms);
-  if (!setup.key) {
-    setup.reason = fileError && fileError !== 'ENOENT'
-      ? `cannot read ${tildify(keyFile)} (${fileError})`
-      : `no AssemblyAI key: set ASSEMBLYAI_API_KEY or assemblyai_api_key in ${tildify(keyFile)}`;
+  const stt = await checkStt();
+  if (!stt.ok) {
+    setup.reason = stt.reason;
     return setup;
   }
   const tools = await checkMediaTools();
@@ -514,10 +519,17 @@ sweepOrphanTempDirs();
 // systemd, ^C by hand) skips every finally, and the orphan sweep only runs at the
 // next start, so a service left stopped would keep the clip until reboot.
 const liveTempDirs = new Set();
+// The stt runs in progress. systemd's control-group kill reaches them anyway, but
+// a plain `kill` of this process would not: SIGTERM makes stt delete the provider
+// job instead of finishing a transcription nobody will read.
+const liveSttRuns = new Set();
 for (const signal of ['SIGTERM', 'SIGINT']) {
   process.once(signal, () => {
     for (const dir of liveTempDirs) {
       try { rmSync(dir, { recursive: true, force: true }); } catch { /* the sweep gets it next start */ }
+    }
+    for (const child of liveSttRuns) {
+      try { child.kill('SIGTERM'); } catch { /* already gone */ }
     }
     // The handler was a once(): re-raising exits the way the default action does,
     // so systemd and the shell see the same status as before.
@@ -633,15 +645,16 @@ async function runTranscription(job, { dir, input, bytes, setup, startedAt }) {
     job.durationMs = Math.round(seconds * 1000);
     const ffmpegMs = Date.now() - t0;
     // ~3.6 MB for ten minutes at 48 kbit/s. Holding it in memory lets the local
-    // copy go before the network phase, however long that ends up taking.
+    // copy go before the network phase, however long that ends up taking: stt
+    // reads it from stdin and keeps it in memory too.
     const audio = await readFile(mp3);
     await rm(dir, { recursive: true, force: true });
-    const r = await transcribeWithAssemblyAI(audio, setup, tag);
+    const r = await transcribeWithStt(audio, tag);
     finishJob(job, { status: 'done', text: r.text, language: r.language });
     // Never the text: the journal is not where a dictated prompt should end up.
     console.log(`${tag} done: ${bytes} B in, ${seconds.toFixed(1)} s audio, language ${r.language || '?'}`
-      + `${r.text ? '' : ' (no speech)'}, ${r.model || 'model ?'}; ffmpeg ${ffmpegMs} ms, upload ${r.uploadMs} ms,`
-      + ` transcribe ${r.transcribeMs} ms, total ${Date.now() - startedAt} ms`);
+      + `${r.text ? '' : ' (no speech)'}, ${r.provider || 'provider ?'}; ffmpeg ${ffmpegMs} ms,`
+      + ` stt ${r.sttMs} ms, total ${Date.now() - startedAt} ms`);
   } catch (e) {
     finishJob(job, {
       status: 'error',
@@ -728,163 +741,116 @@ function fmtClock(seconds) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// Errors carry .transient (worth another poll: network, timeout, 5xx, 429) and
-// .status. AssemblyAI's own message is surfaced so the phone can show it.
-async function aaiRequest(key, method, route, { body, json, timeoutMs, what }) {
-  // The raw key: AssemblyAI takes no "Bearer" prefix.
-  const headers = { Authorization: key };
-  if (json !== undefined) {
-    headers['Content-Type'] = 'application/json';
-    body = JSON.stringify(json);
-  } else if (body !== undefined) {
-    headers['Content-Type'] = 'application/octet-stream';
-  }
-  // Belt and braces: nothing AssemblyAI or undici says should ever echo the key.
-  const scrub = (s) => String(s).split(key).join('[key]');
-  let res;
-  let raw;
-  try {
-    res = await fetch(AAI_BASE + route, { method, headers, body, signal: AbortSignal.timeout(timeoutMs) });
-    raw = await res.text();
-  } catch (e) {
-    const why = e.name === 'TimeoutError' || e.name === 'AbortError'
-      ? `timed out after ${Math.round(timeoutMs / 1000)} s`
-      : (e.cause && (e.cause.code || e.cause.message)) || e.message;
-    throw Object.assign(new Error(scrub(`AssemblyAI ${what} failed: ${why}`)), { transient: true });
-  }
-  let data = null;
-  try { data = JSON.parse(raw); } catch { /* not JSON: surfaced as text below */ }
-  if (!res.ok) {
-    const detail = String(data && typeof data.error === 'string' ? data.error : raw).replace(/\s+/g, ' ').trim().slice(0, 300);
-    throw Object.assign(new Error(scrub(`AssemblyAI ${what} failed: HTTP ${res.status}${detail ? ` — ${detail}` : ''}`)), {
-      status: res.status,
-      transient: res.status >= 500 || res.status === 429 || res.status === 408,
-    });
-  }
-  if (!data || typeof data !== 'object') {
-    throw Object.assign(new Error(`AssemblyAI ${what} failed: the response was not JSON`), { transient: true });
-  }
-  return data;
-}
-
-function transcriptRequest(audioUrl, keyterms) {
+// stt's --json transcript as the job keeps it, or null for anything else.
+function readTranscript(s, t0) {
+  let j = null;
+  try { j = JSON.parse(s); } catch { return null; }
+  if (!j || typeof j !== 'object' || typeof j.text !== 'string') return null;
+  const first = Array.isArray(j.utterances) ? j.utterances[0] : null;
   return {
-    audio_url: audioUrl,
-    // The documented default pair: 3.5 Pro covers en/pt/de and code-switching,
-    // universal-2 catches whatever it doesn't.
-    speech_models: ['universal-3-5-pro', 'universal-2'],
-    language_detection: true,
-    language_detection_options: {
-      // A hint, not a filter. The fallback is what turns silence into a completed
-      // empty transcript ("no speech") instead of an error. Its price: speech in a
-      // language outside these three is forced into English — acceptable for a
-      // user who dictates in exactly these.
-      expected_languages: ['en', 'pt', 'de'],
-      fallback_language: 'en',
-      on_no_speech_detected: 'fallback',
-    },
-    // Omitted rather than sent empty: an empty list was never verified.
-    ...(keyterms.length ? { keyterms_prompt: keyterms } : {}),
+    // An empty text is silence: "no speech detected" on the phone.
+    text: j.text.trim(),
+    // Display and log only. With --no-speakers there is one utterance.
+    language: first && typeof first.language === 'string' ? first.language : null,
+    provider: typeof j.provider === 'string' ? j.provider : null,
+    sttMs: Date.now() - t0,
   };
 }
 
-async function transcribeWithAssemblyAI(audio, { key, keyterms }, tag) {
-  const t0 = Date.now();
-  const up = await aaiRequest(key, 'POST', '/v2/upload', { body: audio, timeoutMs: AAI_UPLOAD_TIMEOUT_MS, what: 'upload' });
-  if (typeof up.upload_url !== 'string') throw new Error('AssemblyAI upload failed: no upload_url in the response');
-  const uploadMs = Date.now() - t0;
-
-  const t1 = Date.now();
-  const submit = (terms) => aaiRequest(key, 'POST', '/v2/transcript',
-    { json: transcriptRequest(up.upload_url, terms), timeoutMs: AAI_SUBMIT_TIMEOUT_MS, what: 'submit' });
-  let submitted;
-  try {
-    submitted = await submit(keyterms);
-  } catch (e) {
-    // Key terms are the one part of the body a config edit can break. Losing them
-    // costs a little accuracy; failing costs the user a paragraph they just said.
-    if (!(keyterms.length && e.status === 400 && /keyterm/i.test(e.message))) throw e;
-    console.log(`${tag} key terms rejected, retrying without them: ${e.message}`);
-    submitted = await submit([]);
-  }
-  const id = submitted.id;
-  if (typeof id !== 'string') throw new Error('AssemblyAI submit failed: no transcript id in the response');
-
-  let final = false;
-  try {
-    const deadline = Date.now() + AAI_POLL_DEADLINE_MS;
-    let lastOk = Date.now();
-    for (;;) {
-      await sleep(AAI_POLL_MS);
-      let t = null;
-      try {
-        t = await aaiRequest(key, 'GET', `/v2/transcript/${encodeURIComponent(id)}`,
-          { timeoutMs: AAI_POLL_TIMEOUT_MS, what: 'status check' });
-        lastOk = Date.now();
-      } catch (e) {
-        if (!e.transient || Date.now() - lastOk > AAI_POLL_ERROR_WINDOW_MS) throw e;
+// One `stt transcribe` per dictation, with the mp3 on stdin. stt takes the provider,
+// key, language hints and key terms from its own config, retries a failed submit,
+// waits out a minute of failing status checks, and deletes the provider's copy on
+// every outcome. Its exit status says what kind of failure it was (../stt/README.md);
+// only a config problem is permanent, since anything else past ffmpeg may pass on a
+// retry. stdout carries the transcript, so it is never logged.
+function transcribeWithStt(audio, tag) {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    const args = ['transcribe', '--json', '--no-speakers', '--timeout', String(STT_WAIT_SECONDS), '-'];
+    const child = spawn(STT_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+    liveSttRuns.add(child);
+    const out = { stdout: [], stderr: [], bytes: 0 };
+    let overflow = false;
+    let timedOut = false;
+    let killTimer = null;
+    let settled = false;
+    // stdout's first line has been looked at; delivered = it was the transcript.
+    let lineRead = false;
+    let delivered = false;
+    const stop = () => {
+      child.kill('SIGTERM');
+      killTimer ||= setTimeout(() => child.kill('SIGKILL'), STT_KILL_GRACE_MS);
+    };
+    // Runs until stt exits, so it also bounds the cleanup after the transcript.
+    const backstop = setTimeout(() => {
+      timedOut = true;
+      console.log(`${tag} stt still running after ${Math.round(STT_BACKSTOP_MS / 1000)} s`
+        + `${delivered ? ', past its transcript' : ''}; stopping it`);
+      stop();
+    }, STT_BACKSTOP_MS);
+    const settle = (err, value) => {
+      if (settled) return;
+      settled = true;
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const collect = (name) => (chunk) => {
+      if (overflow) return;
+      out.bytes += chunk.length;
+      if (out.bytes > STT_MAX_OUTPUT) {
+        overflow = true;
+        stop();
+        return;
       }
-      if (t && t.status === 'completed') {
-        final = true;
-        return {
-          text: typeof t.text === 'string' ? t.text.trim() : '',
-          // Display only: on clips under ~3 s it can be wrong while the text is right.
-          language: typeof t.language_code === 'string' ? t.language_code : null,
-          model: t.speech_model_used || null,
-          uploadMs,
-          transcribeMs: Date.now() - t1,
-        };
+      out[name].push(chunk);
+    };
+    child.stdout.on('data', (chunk) => {
+      collect('stdout')(chunk);
+      // stt writes the transcript as one line, then deletes the provider's copy.
+      // Taken from that line, it reaches the phone without waiting on the cleanup,
+      // and a backstop that cuts the cleanup short cannot lose it.
+      if (settled || lineRead || overflow || !chunk.includes(0x0a)) return;
+      lineRead = true;
+      const s = Buffer.concat(out.stdout).toString('utf8');
+      const r = readTranscript(s.slice(0, s.indexOf('\n')), t0);
+      if (!r) return;
+      delivered = true;
+      settle(null, r);
+    });
+    child.stderr.on('data', collect('stderr'));
+    // Not started at all, so nothing reached a provider.
+    child.on('error', (e) => {
+      if (e.code !== 'ENOENT') return settle(new Error(`could not run stt: ${e.message}`));
+      forgetSttCheck();
+      settle(permanentError(STT_MISSING, 'config'));
+    });
+    // stt exits without reading stdin on a config problem; its exit status says so.
+    child.stdin.on('error', () => {});
+    child.stdin.end(audio);
+    // Also after a spawn 'error': Node closes the pipes of a child that never started.
+    child.on('close', (code, signal) => {
+      clearTimeout(backstop);
+      clearTimeout(killTimer);
+      liveSttRuns.delete(child);
+      const how = signal ? `stt was killed by ${signal}` : `stt exited with status ${code}`;
+      const line = code === 0 ? null : sttMessage(Buffer.concat(out.stderr).toString('utf8'));
+      if (delivered) {
+        // The job has its transcript; only the cleanup can have gone wrong.
+        if (code !== 0) console.log(`${tag} ${how} after its transcript${line ? `: ${line}` : ''}`);
+        return;
       }
-      if (t && t.status === 'error') {
-        final = true;
-        throw new Error(`AssemblyAI: ${String(t.error || 'transcription failed').slice(0, 300)}`);
+      if (timedOut) return settle(new Error('transcription timed out'));
+      if (overflow) return settle(new Error(`stt printed more than ${STT_MAX_OUTPUT >> 20} MB`));
+      if (code !== 0) {
+        if (code !== STT_EXIT_CONFIG) return settle(new Error(line || how));
+        forgetSttCheck();
+        return settle(permanentError(line || how, 'config'));
       }
-      if (Date.now() > deadline) throw new Error(`AssemblyAI did not finish within ${AAI_POLL_DEADLINE_MS / 60000} minutes`);
-    }
-  } finally {
-    // Detached: the phone's answer must not wait on housekeeping.
-    disposeTranscript(key, id, final, tag);
-  }
-}
-
-// DELETE removes the transcript and the uploaded audio at AssemblyAI. It only works
-// on a finished transcript (mid-processing it answers a misleading 400 and the job
-// runs on), so one we stopped waiting for is watched until it finishes first.
-// Best effort: a restart loses this (as does a DELETE still failing after its
-// retries), and AssemblyAI then keeps the transcript for 30 days. An upload whose
-// submit failed can't be deleted at all (gone in 24-48 h).
-async function disposeTranscript(key, id, final, tag) {
-  const route = `/v2/transcript/${encodeURIComponent(id)}`;
-  try {
-    if (!final) {
-      const until = Date.now() + AAI_CLEANUP_WAIT_MS;
-      for (;;) {
-        if (Date.now() > until) {
-          console.log(`${tag} AssemblyAI transcript ${id} still unfinished after ${AAI_CLEANUP_WAIT_MS / 60000} min; left there`);
-          return;
-        }
-        await sleep(10 * 1000);
-        try {
-          const t = await aaiRequest(key, 'GET', route, { timeoutMs: AAI_POLL_TIMEOUT_MS, what: 'status check' });
-          if (t.status === 'completed' || t.status === 'error') break;
-        } catch (e) {
-          if (!e.transient) throw e;
-        }
-      }
-    }
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await aaiRequest(key, 'DELETE', route, { timeoutMs: AAI_POLL_TIMEOUT_MS, what: 'delete' });
-        break;
-      } catch (e) {
-        if (!e.transient || attempt >= AAI_DELETE_RETRY_MS.length) throw e;
-        await sleep(AAI_DELETE_RETRY_MS[attempt]);
-      }
-    }
-    console.log(`${tag} deleted at AssemblyAI`);
-  } catch (e) {
-    console.log(`${tag} could not delete AssemblyAI transcript ${id}: ${e.message}`);
-  }
+      // A transcript without its newline was not taken above.
+      const r = readTranscript(Buffer.concat(out.stdout).toString('utf8'), t0);
+      settle(r ? null : new Error('stt answered with something other than a JSON transcript'), r);
+    });
+  });
 }
 
 // ---------- static files ----------

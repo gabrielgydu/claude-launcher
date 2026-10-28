@@ -1,9 +1,10 @@
-// The dictation API end to end: the real server.mjs, real ffmpeg, a stub
-// AssemblyAI. Run with:  node --test test/transcribe.test.mjs
+// The dictation API end to end: the real server.mjs, real ffmpeg, and a stand-in
+// stt command (see harness.mjs), plus one case through the real stt with its fake
+// provider. Run with:  node --test test/transcribe.test.mjs
 //
-// Two servers run side by side: A takes its key from ASSEMBLYAI_API_KEY, B from
-// a fake key file and has small maxBytes/maxSeconds for the limit cases. Neither
-// touches the live service, its config.json or the real key file.
+// Two servers share the stand-in: A has the shipped limits, B small maxBytes and
+// maxSeconds for the limit cases. Neither touches the live service, its
+// config.json, stt's config or a provider.
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
@@ -15,57 +16,42 @@ import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  UUID_RE, missingTools, makeClips, probeAudio, startAssemblyAIStub, startServer,
+  UUID_RE, missingTools, makeClips, probeAudio, startSttStub, realStt, startServer,
   baseConfig, upload, waitJob, waitFor,
 } from './harness.mjs';
 
-const ENV_KEY = `env-key-${randomUUID()}`;
-const FILE_KEY = `file-key-${randomUUID()}`;
-const OLD_FILE_KEY = `old-file-key-${randomUUID()}`;
 // Padded on purpose: the server must hand the phone trimmed text.
 const STUB_TEXT = '  Refactor the upload handler and add a test.  ';
 const SMALL_MAX_BYTES = 200_000;
 const SMALL_MAX_SECONDS = 2;
+// What server.mjs must run: the mp3 on stdin, the phone's 4-minute deadline.
+const STT_ARGS = ['transcribe', '--json', '--no-speakers', '--timeout', '240', '-'];
 
 const execFileP = promisify(execFile);
 const missing = await missingTools();
 // Everything that needs a clip or an enabled server (which itself needs ffmpeg).
 const needsAudio = missing.length ? `needs ${missing.join(', ')}` : false;
+const REAL_STT = await realStt();
 
 let work;
 let clips;
 let stub;
 let A;
 let B;
-let keyFile;
 let victim; // a local audio file the DASH case must not be able to reach
 
 before(async () => {
   work = await mkdtemp(path.join(os.tmpdir(), 'claude-launcher-test-work-'));
-  keyFile = path.join(work, 'aai.conf');
-  // Same shape as ~/.config/audiorecorder/config: an old key commented out, then
-  // two live lines (the last one must win), and key terms with junk to clean up.
-  await writeFile(keyFile, [
-    '# AssemblyAI',
-    `# assemblyai_api_key=${OLD_FILE_KEY}`,
-    `assemblyai_api_key=${OLD_FILE_KEY}`,
-    `assemblyai_api_key = ${FILE_KEY} `,
-    'assemblyai_keyterms=Claude, tmux , , Playwright, one two three four five six seven, server.mjs, Claude',
-    '',
-  ].join('\n'), { mode: 0o600 });
-  stub = await startAssemblyAIStub({ text: STUB_TEXT, language: 'en' });
+  stub = await startSttStub({ text: STUB_TEXT, language: 'en' });
   if (!needsAudio) {
     clips = await makeClips(work);
     victim = path.join(work, 'victim.m4a');
     await execFileP('ffmpeg', ['-nostdin', '-v', 'error', '-y', '-i', clips.wav, '-c:a', 'aac', victim], { timeout: 30000 });
   }
-  A = await startServer({
-    config: baseConfig({ keyFile }),
-    env: { ASSEMBLYAI_API_KEY: ENV_KEY, ASSEMBLYAI_BASE_URL: stub.url },
-  });
+  A = await startServer({ config: baseConfig(), env: stub.env });
   B = await startServer({
-    config: baseConfig({ keyFile, transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } }),
-    env: { ASSEMBLYAI_BASE_URL: stub.url },
+    config: baseConfig({ transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } }),
+    env: stub.env,
   });
 });
 
@@ -89,6 +75,14 @@ async function transcribe(server, file, type = 'audio/mp4') {
   return waitJob(server.base, r.json.id);
 }
 
+async function transcribeConfig(server) {
+  return (await (await fetch(server.base + '/api/config')).json()).transcribe;
+}
+
+function processGone(pid) {
+  try { process.kill(pid, 0); return false; } catch (e) { return e.code === 'ESRCH'; }
+}
+
 // Raw TCP, for what fetch hides: whether the server hangs up on an unread body.
 // Resolves once the server closes the socket, with everything it sent.
 function rawSocket(port) {
@@ -105,46 +99,56 @@ const withTimeout = (p, ms) => Promise.race([p, new Promise((resolve) => setTime
 // ---------- availability ----------
 
 test('GET /api/config reports dictation available, with maxSeconds from config', { skip: needsAudio }, async () => {
-  const a = await (await fetch(A.base + '/api/config')).json();
-  assert.deepEqual(a.transcribe, { enabled: true, reason: null, maxSeconds: 600 });
-  const b = await (await fetch(B.base + '/api/config')).json();
-  assert.deepEqual(b.transcribe, { enabled: true, reason: null, maxSeconds: SMALL_MAX_SECONDS });
-  // The key must never reach the phone.
-  assert.ok(!JSON.stringify(a).includes(ENV_KEY) && !JSON.stringify(b).includes(FILE_KEY));
+  stub.reset();
+  assert.deepEqual(await transcribeConfig(A), { enabled: true, reason: null, maxSeconds: 600 });
+  assert.deepEqual(await transcribeConfig(B), { enabled: true, reason: null, maxSeconds: SMALL_MAX_SECONDS });
+  assert.deepEqual(stub.checks, [['check'], ['check']], 'each server asks `stt check`');
 });
 
-test('no resolvable key disables dictation with a reason, re-evaluated without a restart', { skip: needsAudio }, async () => {
+test('stt check failing disables dictation with its message, re-evaluated without a restart', { skip: needsAudio }, async () => {
   stub.reset();
-  const noKey = path.join(work, 'nokey.conf');
-  await writeFile(noKey, `# assemblyai_api_key=${OLD_FILE_KEY}\nassemblyai_keyterms=Claude\n`, { mode: 0o600 });
-  const cfg = baseConfig({ keyFile: noKey, transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } });
+  const problem = 'soniox_api_key is not set in /home/someone/.config/stt/config';
+  stub.check = { exit: 3, message: problem };
+  const D = await startServer({ config: baseConfig(), env: stub.env });
   try {
-    await B.writeConfig(cfg);
-    const t = (await (await fetch(B.base + '/api/config')).json()).transcribe;
-    assert.equal(t.enabled, false);
-    assert.match(t.reason, /no AssemblyAI key/);
-    const r = await upload(B.base, await readFile(clips.mp4));
+    const t = await transcribeConfig(D);
+    assert.deepEqual(t, { enabled: false, reason: problem, maxSeconds: 600 });
+    const r = await upload(D.base, await readFile(clips.mp4));
     assert.equal(r.status, 503);
-    assert.equal(r.json.error, t.reason);
+    assert.equal(r.json.error, problem);
     assert.equal(r.headers.get('connection'), 'close');
 
-    await B.writeConfig({ ...cfg, transcription: { ...cfg.transcription, keyFile, enabled: false } });
-    const off = (await (await fetch(B.base + '/api/config')).json()).transcribe;
+    stub.check = { exit: 0 };
+    assert.equal((await transcribeConfig(D)).enabled, true, 'fixing stt\'s config re-enables dictation without a restart');
+
+    await D.writeConfig(baseConfig({ transcription: { enabled: false } }));
+    const off = await transcribeConfig(D);
     assert.equal(off.enabled, false);
     assert.match(off.reason, /disabled/);
   } finally {
-    await B.writeConfig(baseConfig({ keyFile, transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } }));
+    await D.stop();
   }
-  const back = (await (await fetch(B.base + '/api/config')).json()).transcribe;
-  assert.equal(back.enabled, true, 'restoring the key file re-enables dictation without a restart');
-  assert.equal(stub.requests.length, 0, 'nothing may reach AssemblyAI while disabled');
+  assert.equal(stub.calls.length, 0, 'nothing may be transcribed while disabled');
+});
+
+test('stt not installed disables dictation and says how to install it', async () => {
+  const E = await startServer({ config: baseConfig(), env: { ...stub.env, CLAUDE_LAUNCHER_STT: path.join(work, 'no-such-stt') } });
+  try {
+    const t = await transcribeConfig(E);
+    assert.deepEqual(t, { enabled: false, reason: 'stt not found (run ~/development/stt/install.sh)', maxSeconds: 600 });
+    const r = await upload(E.base, Buffer.from('x'), { type: 'audio/mp4' });
+    assert.equal(r.status, 503);
+    assert.equal(r.json.error, t.reason);
+  } finally {
+    await E.stop();
+  }
 });
 
 test('an invalid transcription block disables dictation instead of breaking /api/config', async () => {
-  const cfg = baseConfig({ keyFile, transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } });
+  const cfg = baseConfig({ transcription: { maxBytes: SMALL_MAX_BYTES, maxSeconds: SMALL_MAX_SECONDS } });
   try {
-    // A hand-edit gone wrong: keyFile must be a string.
-    await B.writeConfig({ ...cfg, transcription: { ...cfg.transcription, keyFile: 5 } });
+    // A hand-edit gone wrong: the block must be an object.
+    await B.writeConfig({ ...cfg, transcription: 'on' });
     const r = await fetch(B.base + '/api/config');
     assert.equal(r.status, 200, 'the launcher itself must keep working');
     const c = await r.json();
@@ -176,134 +180,203 @@ test('fragmented MP4/AAC (iOS) is normalized to mono 16 kHz mp3 and transcribed'
   assert.ok(Math.abs(job.durationMs - clips.speechSeconds * 1000) < 500, `durationMs ${job.durationMs} vs ${clips.speechSeconds} s`);
   assert.equal(job.cacheControl, 'no-store');
 
-  // What AssemblyAI was sent.
-  assert.equal(stub.uploads.length, 1);
-  const up = stub.uploads[0];
-  assert.equal(up.auth, ENV_KEY, 'the env key wins over the key file');
-  assert.equal(up.contentType, 'application/octet-stream');
+  // What stt was given.
+  assert.equal(stub.calls.length, 1);
+  const call = stub.calls[0];
+  assert.deepEqual(call.argv, STT_ARGS);
+  assert.deepEqual(call.tempDirs, [], 'the clip must be off the disk before stt runs');
   const sent = path.join(work, 'sent.mp3');
-  await writeFile(sent, up.body);
+  await writeFile(sent, call.audio);
   const a = await probeAudio(sent);
   assert.equal(a.codec, 'mp3');
   assert.equal(a.sampleRate, 16000);
   assert.equal(a.channels, 1);
-  assert.ok(Math.abs(a.duration - clips.speechSeconds) < 0.5, `uploaded ${a.duration} s`);
-
-  assert.equal(stub.submits.length, 1);
-  const s = stub.submits[0];
-  assert.equal(s.auth, ENV_KEY);
-  assert.equal(s.contentType, 'application/json');
-  assert.equal(s.json.audio_url, 'https://cdn.stub.invalid/upload/1');
-  assert.deepEqual(s.json.speech_models, ['universal-3-5-pro', 'universal-2']);
-  assert.equal(s.json.language_detection, true);
-  assert.deepEqual(s.json.language_detection_options, {
-    expected_languages: ['en', 'pt', 'de'], fallback_language: 'en', on_no_speech_detected: 'fallback',
-  });
-  // Trimmed, blanks and duplicates dropped, the seven-word phrase dropped.
-  assert.deepEqual(s.json.keyterms_prompt, ['Claude', 'tmux', 'Playwright', 'server.mjs']);
-  assert.ok(stub.requests.every((q) => q.auth === ENV_KEY));
-
-  // Retention: the transcript is deleted at AssemblyAI once it is back.
-  const [trId] = stub.transcripts.keys();
-  assert.ok(await waitFor(() => stub.deletes.includes(trId), { timeout: 3000 }), 'DELETE /v2/transcript/<id> was not called');
+  assert.ok(Math.abs(a.duration - clips.speechSeconds) < 0.5, `sent ${a.duration} s`);
   await assertNoTempDirs(A);
 });
 
 test('WebM/Opus (Firefox, older Chrome) is transcribed and the detected language passed on', { skip: needsAudio }, async () => {
   stub.reset();
-  stub.outcomes.push({ language: 'pt', pollsBeforeDone: 2 }); // also walks the "processing" loop
+  stub.outcomes.push({ language: 'pt' });
   const job = await transcribe(A, clips.webm, 'audio/webm;codecs=opus');
   assert.equal(job.status, 'done', JSON.stringify(job));
   assert.equal(job.text, STUB_TEXT.trim());
   assert.equal(job.language, 'pt');
   assert.ok(Math.abs(job.durationMs - clips.speechSeconds * 1000) < 500);
-  assert.equal(stub.transcripts.size, 1);
-  assert.ok(await waitFor(() => stub.deletes.length === 1, { timeout: 3000 }));
+  assert.equal(stub.calls.length, 1);
   await assertNoTempDirs(A);
 });
 
-test('without an env key the key file is used, last uncommented value winning', { skip: needsAudio }, async () => {
+test('silence: an empty transcript is a finished job with empty text', { skip: needsAudio }, async () => {
   stub.reset();
-  const job = await transcribe(B, clips.mp4);
+  stub.outcomes.push({ text: '' });
+  const job = await transcribe(A, clips.mp4);
   assert.equal(job.status, 'done', JSON.stringify(job));
-  assert.ok(stub.requests.length > 0);
-  assert.ok(stub.requests.every((q) => q.auth === FILE_KEY), JSON.stringify(stub.requests.map((q) => q.auth === OLD_FILE_KEY ? 'OLD' : q.auth === FILE_KEY ? 'LIVE' : 'OTHER')));
-  await assertNoTempDirs(B);
-});
-
-// ---------- failures at AssemblyAI ----------
-
-test('a transcript that fails at AssemblyAI becomes a job error carrying its message', { skip: needsAudio }, async () => {
-  stub.reset();
-  stub.outcomes.push({ error: 'Audio duration is too short.' });
-  const job = await transcribe(A, clips.mp4);
-  assert.equal(job.status, 'error');
-  assert.match(job.error, /Audio duration is too short\./);
-  assert.equal(job.text, undefined);
-  assert.equal(job.retryable, true, 'failures past ffmpeg may succeed on a retry');
-  // An errored transcript is final, so it can (and must) be deleted too.
-  assert.ok(await waitFor(() => stub.deletes.length === 1, { timeout: 3000 }));
+  assert.equal(job.text, '');
+  assert.equal(job.language, undefined);
   await assertNoTempDirs(A);
 });
 
-test('AssemblyAI rejecting the upload (401) is a job error that never echoes the key', { skip: needsAudio }, async () => {
+test('the job is done once stt writes the transcript, without waiting for its cleanup', { skip: needsAudio }, async () => {
   stub.reset();
-  // A hostile or buggy upstream quoting the key back must not get it to the phone.
-  stub.uploadFailures.push({ status: 401, body: { error: `Invalid API key: ${ENV_KEY}` } });
-  const job = await transcribe(A, clips.mp4);
-  assert.equal(job.status, 'error');
-  assert.match(job.error, /upload failed: HTTP 401/);
-  assert.equal(job.retryable, true, 'the key is re-read per dictation, so fixing it then retrying works');
-  assert.ok(!job.error.includes(ENV_KEY), 'key leaked into the job error');
-  assert.match(job.error, /\[key\]/);
-  assert.equal(stub.submits.length, 0);
-  await assertNoTempDirs(A);
-});
-
-test('AssemblyAI failing the upload (500) is a job error', { skip: needsAudio }, async () => {
-  stub.reset();
-  stub.uploadFailures.push({ status: 500, body: '<html>internal error</html>' });
-  const job = await transcribe(A, clips.mp4);
-  assert.equal(job.status, 'error');
-  assert.match(job.error, /upload failed: HTTP 500/);
-  await assertNoTempDirs(A);
-});
-
-test('a burst of fast poll failures is waited out, not counted against the job', { skip: needsAudio }, async () => {
-  stub.reset();
-  // Five resets in a row, each failing at once: what a Wi-Fi roam or a DNS hiccup
-  // on the PC looks like. The transcript is ready the moment the network is back.
-  for (let i = 0; i < 5; i++) stub.pollFailures.push({ reset: true });
-  const job = await transcribe(A, clips.mp4);
+  stub.outcomes.push({ cleanup: 'hold' });
+  const r = await upload(A.base, await readFile(clips.mp4));
+  assert.equal(r.status, 202);
+  // The held cleanup would keep a server that waits for stt's exit processing.
+  const job = await waitJob(A.base, r.json.id, 10000);
   assert.equal(job.status, 'done', JSON.stringify(job));
   assert.equal(job.text, STUB_TEXT.trim());
-  assert.equal(stub.pollFailures.length, 0, 'every scripted failure was hit');
+  const { pid } = stub.calls[0];
+  assert.ok(!processGone(pid), 'stt had already exited, so this proves nothing');
+  stub.release();
+  assert.ok(await waitFor(() => processGone(pid), { timeout: 3000 }), 'stt never finished its cleanup');
   await assertNoTempDirs(A);
 });
 
-test('a transient failure deleting the transcript at AssemblyAI is retried', { skip: needsAudio }, async () => {
+// ---------- failures at stt ----------
+
+test('stt failing is a retryable job error carrying its stt: line, never the progress lines', { skip: needsAudio }, async () => {
   stub.reset();
-  stub.deleteFailures.push({ reset: true });
+  stub.outcomes.push({ exit: 4, message: 'HTTP 402 Payment Required: no credit left' });
   const job = await transcribe(A, clips.mp4);
-  assert.equal(job.status, 'done', JSON.stringify(job));
-  const [trId] = stub.transcripts.keys();
-  assert.ok(await waitFor(() => stub.deletes.includes(trId), { timeout: 6000 }), 'the transcript was left at AssemblyAI');
-  assert.equal(stub.deleteFailures.length, 0);
+  assert.equal(job.status, 'error');
+  assert.equal(job.error, 'stt: HTTP 402 Payment Required: no credit left');
+  assert.equal(job.text, undefined);
+  assert.equal(job.retryable, true, 'failures past ffmpeg may succeed on a retry');
+  assert.equal(job.code, undefined);
+  // Cut for the phone, whatever stt sends.
+  stub.outcomes.push({ exit: 5, message: `network: ${'x'.repeat(400)}` });
+  const long = await transcribe(A, clips.mp4);
+  assert.equal(long.error.length, 300);
+  assert.equal(long.retryable, true);
+  await assertNoTempDirs(A);
 });
 
-test('key terms rejected by AssemblyAI: the submit is retried once without them', { skip: needsAudio }, async () => {
+test('a config problem at stt (exit 3) is not retryable, and the next /api/config checks again', { skip: needsAudio }, async () => {
   stub.reset();
-  stub.submitFailures.push({ status: 400, body: { error: 'keyterms_prompt is invalid' }, onlyWithKeyterms: true });
-  const job = await transcribe(A, clips.mp4);
-  assert.equal(job.status, 'done', JSON.stringify(job));
-  assert.equal(stub.submits.length, 2);
-  assert.ok(Array.isArray(stub.submits[0].json.keyterms_prompt));
-  assert.equal(stub.submits[1].json.keyterms_prompt, undefined);
+  const F = await startServer({ config: baseConfig(), env: stub.env });
+  try {
+    assert.equal((await transcribeConfig(F)).enabled, true);
+    const problem = 'soniox_api_key is not set in /home/someone/.config/stt/config';
+    stub.outcomes.push({ exit: 3, message: problem });
+    const job = await transcribe(F, clips.mp4);
+    assert.equal(stub.checks.length, 1, 'the upload reuses a fresh OK check');
+    assert.equal(job.status, 'error');
+    assert.equal(job.error, `stt: ${problem}`);
+    assert.equal(job.retryable, false, 'the same clip fails the same way until the config is fixed');
+    assert.equal(job.code, 'config');
+
+    stub.check = { exit: 3, message: problem };
+    assert.deepEqual(await transcribeConfig(F), { enabled: false, reason: problem, maxSeconds: 600 });
+    assert.equal(stub.checks.length, 2, 'the failed job dropped the cached OK');
+    stub.check = { exit: 0 };
+    assert.equal((await transcribeConfig(F)).enabled, true, 'fixing it turns the mic back on at once');
+    await assertNoTempDirs(F);
+  } finally {
+    await F.stop();
+  }
+});
+
+test('stt output the server cannot use is a retryable error that never echoes it', { skip: needsAudio }, async () => {
+  stub.reset();
+  const cases = [
+    [{ raw: 'Speaker A: not json at all\n' }, 'stt answered with something other than a JSON transcript'],
+    [{ raw: '{"provider": "stub"}\n' }, 'stt answered with something other than a JSON transcript'],
+    // A crash without stt's own last line: the traceback stays off the phone.
+    [{ exit: 1, stderr: 'Traceback (most recent call last):\n  File "cli.py"\nValueError: secret detail\n' }, 'stt exited with status 1'],
+    [{ raw: 'y'.repeat(1.5 * 1024 * 1024) }, 'stt printed more than 1 MB'],
+  ];
+  for (const [outcome, want] of cases) {
+    stub.outcomes.push(outcome);
+    const job = await transcribe(A, clips.mp4);
+    assert.equal(job.status, 'error', want);
+    assert.equal(job.error, want);
+    assert.equal(job.retryable, true, want);
+  }
+  assert.ok(!A.log.includes('not json') && !A.log.includes('secret detail') && !A.log.includes('yyyy'), 'stt output reached the log');
+  await assertNoTempDirs(A);
+});
+
+test('stt still running at the backstop is stopped (SIGTERM, then SIGKILL) and the job times out', { skip: needsAudio }, async () => {
+  stub.reset();
+  const H = await startServer({ config: baseConfig(), env: { ...stub.env, CLAUDE_LAUNCHER_STT_BACKSTOP_MS: '1000' } });
+  try {
+    stub.outcomes.push({ hang: true }, { hang: true, ignoreTerm: true });
+    for (const label of ['stops on SIGTERM', 'ignores SIGTERM']) {
+      const job = await transcribe(H, clips.mp4);
+      assert.equal(job.status, 'error', label);
+      assert.equal(job.error, 'transcription timed out', label);
+      assert.equal(job.retryable, true, label);
+      assert.ok(processGone(stub.calls.at(-1).pid), `${label}: stt still running`);
+    }
+    assert.match(H.log, /stt still running after 1 s; stopping it/);
+    await assertNoTempDirs(H);
+  } finally {
+    await H.stop();
+  }
+});
+
+test('a cleanup that the backstop cuts short keeps the transcript stt already wrote', { skip: needsAudio }, async () => {
+  stub.reset();
+  // Long enough that the transcript is out well before it.
+  const H = await startServer({ config: baseConfig(), env: { ...stub.env, CLAUDE_LAUNCHER_STT_BACKSTOP_MS: '2000' } });
+  try {
+    stub.outcomes.push({ cleanup: 'hang' });
+    const job = await transcribe(H, clips.mp4);
+    assert.equal(job.status, 'done', JSON.stringify(job));
+    assert.equal(job.text, STUB_TEXT.trim());
+    // Still reaped: the backstop outlives the job.
+    const { pid } = stub.calls[0];
+    assert.ok(await waitFor(() => processGone(pid), { timeout: 5000 }), 'the backstop left stt running');
+    assert.match(H.log, /stt still running after 2 s, past its transcript; stopping it/);
+    assert.match(H.log, /stt exited with status 143 after its transcript: stt: SIGTERM arrived after the transcript was written/);
+    assert.ok(!H.log.includes('timed out'), H.log);
+    await assertNoTempDirs(H);
+  } finally {
+    await H.stop();
+  }
+});
+
+// ---------- the real stt ----------
+
+test('through the real stt and its fake provider: a transcript, a refusal, a config problem', { skip: needsAudio || (!REAL_STT && 'needs stt on PATH') }, async () => {
+  const sttConfig = path.join(work, 'stt.conf');
+  await writeFile(sttConfig, 'provider = fake\n', { mode: 0o600 });
+  const R = await startServer({ config: baseConfig(), env: { CLAUDE_LAUNCHER_STT: REAL_STT, STT_CONFIG: sttConfig } });
+  try {
+    assert.deepEqual(await transcribeConfig(R), { enabled: true, reason: null, maxSeconds: 600 });
+
+    const job = await transcribe(R, clips.mp4);
+    assert.equal(job.status, 'done', JSON.stringify(job));
+    // The fake provider says what it got: audio from stdin, and how many bytes.
+    const m = /^fake transcript of audio \((\d+) bytes\)$/.exec(job.text);
+    assert.ok(m && Number(m[1]) > 1000, job.text);
+    assert.equal(job.language, 'en');
+
+    await writeFile(sttConfig, 'provider = fake\nfake_fail = submit:credit\n');
+    const refused = await transcribe(R, clips.mp4);
+    assert.equal(refused.status, 'error');
+    assert.equal(refused.error, 'stt: HTTP 402 Payment Required: fake credit failure');
+    assert.equal(refused.retryable, true);
+
+    await writeFile(sttConfig, 'provider = soniox\n');
+    const noKey = await transcribe(R, clips.mp4);
+    assert.equal(noKey.status, 'error');
+    assert.equal(noKey.error, `stt: soniox_api_key is not set in ${sttConfig}`);
+    assert.equal(noKey.retryable, false);
+    assert.equal(noKey.code, 'config');
+    assert.deepEqual(await transcribeConfig(R), { enabled: false, reason: `soniox_api_key is not set in ${sttConfig}`, maxSeconds: 600 });
+
+    assert.ok(!R.log.includes('fake transcript of'), 'transcript text reached the log');
+    await assertNoTempDirs(R);
+  } finally {
+    await R.stop();
+  }
 });
 
 // ---------- bad audio ----------
 
-test('a 0.2 s clip is "no audio captured" and never reaches AssemblyAI', { skip: needsAudio }, async () => {
+test('a 0.2 s clip is "no audio captured" and never reaches stt', { skip: needsAudio }, async () => {
   stub.reset();
   const job = await transcribe(A, clips.short);
   assert.equal(job.status, 'error');
@@ -311,7 +384,7 @@ test('a 0.2 s clip is "no audio captured" and never reaches AssemblyAI', { skip:
   // The same clip fails the same way: the phone must not offer Retry.
   assert.equal(job.retryable, false);
   assert.equal(job.code, 'no_audio');
-  assert.equal(stub.requests.length, 0);
+  assert.equal(stub.calls.length, 0);
   await assertNoTempDirs(A);
 });
 
@@ -323,7 +396,7 @@ test('a non-audio body labelled audio/mp4 is a job error, and the message hides 
   assert.equal(job.status, 'error');
   assert.match(job.error, /no audio captured/);
   assert.ok(!job.error.includes(A.tmp) && !job.error.includes('claude-launcher-dictation-'), job.error);
-  assert.equal(stub.requests.length, 0);
+  assert.equal(stub.calls.length, 0);
   await assertNoTempDirs(A);
 });
 
@@ -334,7 +407,7 @@ test('a recording longer than maxSeconds (+5 s grace) is refused', { skip: needs
   assert.match(job.error, /longer than the 0:02 limit/);
   assert.equal(job.retryable, false);
   assert.equal(job.code, 'too_long');
-  assert.equal(stub.requests.length, 0);
+  assert.equal(stub.calls.length, 0);
   await assertNoTempDirs(B);
 });
 
@@ -351,7 +424,7 @@ test('a DASH manifest cannot make ffmpeg read a local file', { skip: needsAudio 
   const job = await waitJob(A.base, r.json.id);
   assert.equal(job.status, 'error', JSON.stringify(job));
   assert.equal(job.durationMs, undefined);
-  assert.equal(stub.requests.length, 0, 'the local file reached AssemblyAI');
+  assert.equal(stub.calls.length, 0, 'the local file reached stt');
   await assertNoTempDirs(A);
 });
 
@@ -372,14 +445,14 @@ test('ffmpeg killed for flooding stderr is a failed conversion, not a truncated 
   ].join('\n'));
   await chmod(path.join(bin, 'ffmpeg'), 0o755);
   const C = await startServer({
-    config: baseConfig({ keyFile }),
-    env: { ASSEMBLYAI_API_KEY: ENV_KEY, ASSEMBLYAI_BASE_URL: stub.url, PATH: `${bin}:${process.env.PATH}` },
+    config: baseConfig(),
+    env: { ...stub.env, PATH: `${bin}:${process.env.PATH}` },
   });
   try {
     const job = await transcribe(C, clips.mp4);
     assert.equal(job.status, 'error', JSON.stringify(job));
     assert.match(job.error, /audio conversion failed/);
-    assert.equal(stub.requests.length, 0);
+    assert.equal(stub.calls.length, 0);
     await assertNoTempDirs(C);
   } finally {
     await C.stop();
@@ -502,7 +575,7 @@ test('at most 4 transcriptions at once: the fifth upload gets 429, and slots com
   assert.equal(fifth.status, 429);
   assert.equal(fifth.headers.get('connection'), 'close');
 
-  assert.ok(await waitFor(() => stub.transcripts.size === 4, { timeout: 10000 }), 'the four jobs never reached AssemblyAI');
+  assert.ok(await waitFor(() => stub.calls.length === 4, { timeout: 10000 }), 'the four jobs never reached stt');
   stub.release();
   const jobs = await Promise.all(first.map((r) => waitJob(A.base, r.json.id)));
   assert.deepEqual(jobs.map((j) => j.status), ['done', 'done', 'done', 'done']);
@@ -513,10 +586,7 @@ test('at most 4 transcriptions at once: the fifth upload gets 429, and slots com
 });
 
 test('SIGTERM mid-upload removes the clip before the server exits', { skip: needsAudio }, async () => {
-  const S = await startServer({
-    config: baseConfig({ keyFile }),
-    env: { ASSEMBLYAI_API_KEY: ENV_KEY, ASSEMBLYAI_BASE_URL: stub.url },
-  });
+  const S = await startServer({ config: baseConfig(), env: stub.env });
   try {
     const s = rawSocket(S.port);
     await s.connected;
@@ -540,14 +610,32 @@ test('SIGTERM mid-upload removes the clip before the server exits', { skip: need
   }
 });
 
+test('SIGTERM while stt runs stops stt too, so it deletes the provider job', { skip: needsAudio }, async () => {
+  stub.reset();
+  const S = await startServer({ config: baseConfig(), env: stub.env });
+  try {
+    stub.outcomes.push({ hang: true });
+    const r = await upload(S.base, await readFile(clips.mp4));
+    assert.equal(r.status, 202);
+    assert.ok(await waitFor(() => stub.calls.length === 1, { timeout: 10000 }), 'stt never ran');
+    const exited = once(S.proc, 'exit');
+    S.proc.kill('SIGTERM');
+    await exited;
+    assert.equal(S.proc.signalCode, 'SIGTERM', 'the exit status systemd sees is unchanged');
+    // The stand-in only exits early on SIGTERM; otherwise it hangs for a minute.
+    assert.ok(await waitFor(() => processGone(stub.calls[0].pid), { timeout: 3000 }), 'stt outlived the server');
+  } finally {
+    await S.stop();
+  }
+});
+
 // Last, so it sees every log line the cases above produced.
-test('the server logs never contain the key or the transcript text', async () => {
+test('the server logs never contain the transcript text', async () => {
   for (const [name, s] of [['A', A], ['B', B]]) {
-    for (const secret of [ENV_KEY, FILE_KEY, OLD_FILE_KEY]) assert.ok(!s.log.includes(secret), `server ${name} logged a key`);
     assert.ok(!s.log.includes(STUB_TEXT.trim()), `server ${name} logged transcript text`);
   }
   // Sanity check that the logs were captured at all.
-  if (!needsAudio) assert.match(A.log, /\[transcribe\] .* done: /);
+  if (!needsAudio) assert.match(A.log, /\[transcribe\] .* done: .*, stub; ffmpeg \d+ ms, stt \d+ ms, total \d+ ms/);
   assert.deepEqual(await readdir(A.tmp), []);
   assert.deepEqual(await readdir(B.tmp), []);
 });

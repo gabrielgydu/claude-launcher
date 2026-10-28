@@ -5,7 +5,7 @@
   "remoteControl": true,
   "allowedRoots": ["~"],
   "allowedHosts": ["127.0.0.1", "localhost"],
-  "transcription": { "enabled": true, "keyFile": "~/.config/audiorecorder/config", "maxSeconds": 600, "maxBytes": 26214400 },
+  "transcription": { "enabled": true, "maxSeconds": 600, "maxBytes": 26214400 },
   "models": [
     { "id": "opus", "label": "Opus" },
     { "id": "fable", "label": "Fable" }

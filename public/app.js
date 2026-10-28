@@ -317,7 +317,7 @@ function insertTranscript(text, atEnd) {
 }
 
 // ---------- dictation ----------
-// Phone records -> POST /api/transcribe -> the PC transcribes (AssemblyAI) ->
+// Phone records -> POST /api/transcribe -> the PC transcribes (stt) ->
 // poll GET /api/transcribe/<id> -> text inserted at the caret. The audio stays
 // in memory until its transcript lands so Retry re-sends the same clip; only the
 // job id is persisted, so a reload can pick the result up.
